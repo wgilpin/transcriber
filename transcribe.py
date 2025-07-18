@@ -18,6 +18,8 @@ WHISPER_MODEL = "base.en"
 DIARIZATION_MODEL = "pyannote/speaker-diarization-3.1"
 OLLAMA_MODEL = "gemma3:27b"
 SUPPORTED_EXTENSIONS = [".mp3", ".wav", ".m4a", ".flac"]
+# Increased threshold for fixing UNKNOWN segments to handle longer pauses
+CLEANUP_TIME_THRESHOLD_S = 1.5 
 
 # --- Environment Setup ---
 load_dotenv()
@@ -44,6 +46,7 @@ def format_timestamp(seconds: float) -> str:
 
 def sanitize_filename(name):
     """Removes invalid characters from a string to make it a valid filename."""
+    name = name.replace('\n', ' ').replace('**', '').strip()
     return re.sub(r'[\\/*?:"<>|]', "", name)
 
 
@@ -84,7 +87,7 @@ def apply_collar_fix(
     return corrected_diarization.support()
 
 
-def fix_leading_unknowns(combined_result, time_threshold=0.5):
+def fix_leading_unknowns(combined_result, time_threshold=CLEANUP_TIME_THRESHOLD_S):
     """Merges an UNKNOWN word with the subsequent speaker's turn if they are close in time."""
     if len(combined_result) < 2:
         return combined_result
@@ -103,7 +106,7 @@ def fix_leading_unknowns(combined_result, time_threshold=0.5):
     return combined_result
 
 
-def fix_trailing_unknowns(combined_result, time_threshold=0.5):
+def fix_trailing_unknowns(combined_result, time_threshold=CLEANUP_TIME_THRESHOLD_S):
     """Merges an UNKNOWN word with the preceding speaker's turn if they are close in time."""
     if len(combined_result) < 2:
         return combined_result
@@ -196,69 +199,54 @@ def query_ollama(prompt):
         return "Error: Could not retrieve response from Ollama."
 
 
-def get_llm_title(transcript_text):
-    """Generates a descriptive filename title from a transcript using the LLM."""
+def get_llm_title(source_text):
+    """Generates a descriptive filename title from a text (summary or transcript) using the LLM."""
     logging.info("Generating descriptive title with LLM...")
-    prompt = f"""Based on the following transcript, generate a single, short, descriptive phrase of 4-8 words suitable for a filename.
-        - Do NOT use any special characters like quotes or colons.
-        - Do NOT explain your thinking.
-        - Provide ONLY the title phrase itself.
+    prompt = f"""Based on the following text, generate a single, short, descriptive phrase of 4-8 words suitable for a filename.
+- Do NOT use any special characters like quotes or colons.
+- Do NOT explain your thinking.
+- Provide ONLY the title phrase itself.
 
-        Example: Initial Project Kick-off with the Analytics Team
+Example: Initial Project Kick-off with the Analytics Team
 
-        Here is the transcript:
-        ---
-        {transcript_text}
-        ---
-        """
+Here is the text:
+---
+{source_text}
+---
+"""
     title = query_ollama(prompt)
-    # Take only the first line of the response to be safe
     clean_title = title.split('\n')[0].strip()
-    if len(title) > 100:
-        logging.info("Title too long, shortening")
-        shorten_prompt = f"""The following summary is far too long. Based on it, generate a single, short, descriptive phrase of 4-8 words suitable for a filename.
-            - Do NOT use any special characters like quotes or colons. 
-            - Do not generate markdown.
-            - Make the title meaningful, such as "Bill and John discussing pipelines".
-            - "Summary of the conversation" Is not meaningful so explain what the conversation is about.
-            - Do NOT explain your thinking.
-            - Provide ONLY the title phrase itself.
-
-            Example: Initial Project Kick-off with the Analytics Team
-
-            Here is the summary:
-            ---
-            {title}
-            ---
-            """
-
-    logging.info(f"Generated title: {clean_title}")
     return sanitize_filename(clean_title)
 
 
-def get_llm_summaries(transcript_text):
+def get_llm_summary_and_actions(transcript_text):
     """
-    Generates a summary and action items from a transcript using the LLM. Do not explain your thinking or mention the transcript.
+    Generates a summary and action items from a transcript in a single LLM call.
     """
     logging.info("Generating summary and action items with LLM...")
-    summary_prompt = f"""Please provide a concise, professional summary of the following meeting transcript. Focus on the key decisions and outcomes. The summary should be short and only cover the main points. Do not explain your thinking or mention the transcript.
+    prompt = f"""Please provide a summary and action points (if any) for the following meeting transcript.
+Focus on the key decisions and outcomes.
+The summary should be short and cover the main points.
+For the action items, extract all explicit action items and identify the assigned person if mentioned. Format as a markdown list. If no action items are found, state that clearly.
+Your entire response MUST be in markdown format, starting with a '## Summary' section followed by an '## Action Items' section. For example:
+
+## Summary
+
+The meeting was a discussion between Bill and Dave on pipeline observability. They concluded more work was needed.
+
+## Action Items
+
+* Document the current status (Assigned to Bill).
+* Set up a team meeting to discuss (Assigned to Dave).
 
 Here is the transcript:
 ---
 {transcript_text}
 ---
 """
-    action_items_prompt = f"""Based on the following transcript, extract all explicit action items. For each, identify the assigned person if mentioned. Format as a markdown list. If no action items are found, state that clearly. Do not explain your thinking or mention the transcript.
+    summary_and_actions = query_ollama(prompt)
+    return summary_and_actions
 
-Here is the transcript:
----
-{transcript_text}
----
-"""
-    summary = query_ollama(summary_prompt)
-    action_items = query_ollama(action_items_prompt)
-    
-    return summary, action_items
 
 # --- Main Processing Logic ---
 
@@ -269,6 +257,7 @@ def process_audio_file(
     Processes an audio file to generate a transcript markdown file.
     """
     base_filepath = os.path.splitext(filepath)[0]
+    logging.info("------------------------------")
     logging.info(f"Starting full processing for: {os.path.basename(filepath)}")
 
     # 1. Transcription
@@ -317,18 +306,17 @@ def process_audio_file(
     formatted_transcript = format_final_transcript(combined_transcript)
 
     # 5. LLM Summarization
-    summary, action_items = get_llm_summaries(formatted_transcript)
+    summary_section = get_llm_summary_and_actions(formatted_transcript)
 
-    # 6. Generate Descriptive Filename
-    title = get_llm_title(formatted_transcript)
+    # 6. Generate Descriptive Filename from the summary
+    title = get_llm_title(summary_section)
     output_filename = f"{base_filepath} {title}.md"
 
     # 7. Write to File
     logging.info(f"Step 7: Writing output to {os.path.basename(output_filename)}")
     with open(output_filename, "w", encoding="utf-8") as f:
         f.write(f"# Meeting Notes: {os.path.basename(filepath)}\n\n")
-        f.write(f"## Summary\n\n{summary}\n\n")
-        f.write(f"## Action Items\n\n{action_items}\n\n")
+        f.write(f"{summary_section}\n\n")
         f.write("---\n\n## Full Transcript\n\n")
         f.write(formatted_transcript)
         f.write("\n")
@@ -430,19 +418,13 @@ def interactive_renaming(md_filepath):
 
     named_transcript_text = updated_content.split("## Full Transcript\n\n")[-1]
     
-    new_summary, new_action_items = get_llm_summaries(named_transcript_text)
+    new_summary_section = get_llm_summary_and_actions(named_transcript_text)
 
-    # Replace old summary/actions and add attendees section
+    # Replace old summary/actions section and add attendees
     final_content = re.sub(
-        r"(## Summary\n\n)(.*?)(\n\n## Action Items)",
-        f"\\1{new_summary}\\3",
+        r"(# Meeting Notes: .*?\n\n)(.*?)(\n\n---)",
+        f"\\1{new_summary_section}\\3",
         updated_content,
-        flags=re.DOTALL
-    )
-    final_content = re.sub(
-        r"(## Action Items\n\n)(.*?)(\n\n---)",
-        f"\\1{new_action_items}\\3",
-        final_content,
         flags=re.DOTALL
     )
 
@@ -526,17 +508,11 @@ def main():
 
     for file_path in files_to_process:
         try:
-            # Note: We can't know the final descriptive filename yet, so we look for a base .md file.
-            base_md_path = os.path.splitext(file_path)[0] + ".md"
-
-            # This logic needs adjustment to find files with descriptive names.
-            # For now, we simplify and assume if a base .md exists, it's a candidate.
-            # A more robust solution might check for " 2*.md"
-            
-            # Simplified check: Find any .md file that starts with the base name
             directory, base_name = os.path.split(os.path.splitext(file_path)[0])
+            directory = directory or '.'
+            
             existing_md_file = None
-            for f in os.listdir(directory or '.'):
+            for f in os.listdir(directory):
                 if f.startswith(base_name) and f.endswith('.md'):
                     existing_md_file = os.path.join(directory, f)
                     break
