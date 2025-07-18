@@ -390,11 +390,14 @@ def interactive_renaming(md_filepath):
             print("  Context:")
             print(hint)
             
-            new_name = input(f"Enter name for {label} (or type 'SKIP'): ")
+            new_name = input(f"Enter name for {label} (or 'SKIP' for all, '?' for this one): ")
 
             if new_name.lower() == 'skip':
                 skip_all = True
                 break
+            elif new_name == '?':
+                logging.info(f"Skipping speaker {label} for now.")
+                break 
             elif new_name:
                 name_map[label] = new_name.strip()
                 break
@@ -432,10 +435,19 @@ def interactive_renaming(md_filepath):
     else:
         final_content = final_content.replace("\n\n---", f"\n\n{attendees_section}---")
 
-    with open(md_filepath, 'w', encoding='utf-8') as f:
+    # After renaming, we may need a new filename
+    new_title = get_llm_title(new_summary_section)
+    base_filepath = os.path.splitext(md_filepath)[0].split(' ')[0] 
+    new_filepath = f"{base_filepath} {new_title}.md"
+
+    with open(new_filepath, 'w', encoding='utf-8') as f:
         f.write(final_content)
     
-    logging.info(f"Successfully updated speaker names and summaries in {os.path.basename(md_filepath)}.")
+    if new_filepath != md_filepath:
+        logging.info(f"Renaming output file to: {os.path.basename(new_filepath)}")
+        os.remove(md_filepath)
+    
+    logging.info(f"Successfully updated speaker names and summaries in {os.path.basename(new_filepath)}.")
 
 
 def main():
@@ -503,6 +515,8 @@ def main():
     is_single_file_run = os.path.isfile(args.path)
 
     for file_path in files_to_process:
+        logging.info("---")
+        logging.info(f"Processing file: {os.path.basename(file_path)}")
         try:
             directory, base_name = os.path.split(os.path.splitext(file_path)[0])
             directory = directory or '.'
