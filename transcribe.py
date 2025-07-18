@@ -224,16 +224,20 @@ def get_llm_summary_and_actions(transcript_text):
     Generates a summary and action items from a transcript in a single LLM call.
     """
     logging.info("Generating summary and action items with LLM...")
-    prompt = f"""Your task is to generate a concise summary and a list of action items from the provided meeting transcript.
+    prompt = f"""Please provide a summary and action points (if any) for the following meeting transcript.
+Focus on the key decisions and outcomes.
+The summary should be short and cover the main points.
+For the action items, extract all explicit action items and identify the assigned person if mentioned. Format as a markdown list. If no action items are found, state that clearly.
+Your entire response MUST be in markdown format, starting with a '## Summary' section followed by an '## Action Items' section. For example:
 
-First, write a '## Summary' of the key decisions and outcomes.
+## Summary
 
-Second, write a separate '## Action Items' section.
-- Extract ALL explicit action items from the transcript.
-- For each action item, identify the person it was assigned to.
-- If no action items are found, explicitly state "No action items were identified."
+The meeting was a discussion between Bill and Dave on pipeline observability. They concluded more work was needed.
 
-Format your entire response in markdown.
+## Action Items
+
+* Document the current status (Assigned to Bill).
+* Set up a team meeting to discuss (Assigned to Dave).
 
 Here is the transcript:
 ---
@@ -247,14 +251,17 @@ Here is the transcript:
 # --- Main Processing Logic ---
 
 def process_audio_file(
-    filepath, whisper_model, diarization_pipeline
+    filepath, whisper_model, diarization_pipeline, interactive_mode=False
 ):
     """
     Processes an audio file to generate a transcript markdown file.
     """
     base_filepath = os.path.splitext(filepath)[0]
     logging.info("------------------------------")
-    logging.info(f"Starting full processing for: {os.path.basename(filepath)}")
+    # In interactive mode, the initial output is temporary.
+    output_filename = f"{base_filepath}.md"
+    
+    logging.info("Starting audio processing for: %s", os.path.basename(filepath))
 
     # 1. Transcription
     logging.info("Step 1: Transcribing audio...")
@@ -301,15 +308,17 @@ def process_audio_file(
     # 4. Final Formatting
     formatted_transcript = format_final_transcript(combined_transcript)
 
-    # 5. LLM Summarization
-    summary_section = get_llm_summary_and_actions(formatted_transcript)
+    # 5. LLM Summarization (Conditional)
+    if not interactive_mode:
+        summary_section = get_llm_summary_and_actions(formatted_transcript)
+        title = get_llm_title(summary_section)
+        output_filename = f"{base_filepath} {title}.md"
+    else:
+        # In interactive mode, we use placeholder content initially
+        summary_section = "## Summary\n\n[Summary to be generated after speaker naming.]\n\n## Action Items\n\n[Action items to be generated after speaker naming.]"
 
-    # 6. Generate Descriptive Filename from the summary
-    title = get_llm_title(summary_section)
-    output_filename = f"{base_filepath} {title}.md"
-
-    # 7. Write to File
-    logging.info(f"Step 7: Writing output to {os.path.basename(output_filename)}")
+    # 6. Write to File
+    logging.info(f"Writing output to {os.path.basename(output_filename)}")
     with open(output_filename, "w", encoding="utf-8") as f:
         f.write(f"# Meeting Notes: {os.path.basename(filepath)}\n\n")
         f.write(f"{summary_section}\n\n")
@@ -435,7 +444,6 @@ def interactive_renaming(md_filepath):
     else:
         final_content = final_content.replace("\n\n---", f"\n\n{attendees_section}---")
 
-    # After renaming, we may need a new filename
     new_title = get_llm_title(new_summary_section)
     base_filepath = os.path.splitext(md_filepath)[0].split(' ')[0] 
     new_filepath = f"{base_filepath} {new_title}.md"
@@ -539,7 +547,7 @@ def main():
             
             else:
                 output_md_path_from_process = process_audio_file(
-                    file_path, whisper_model, diarization_pipeline
+                    file_path, whisper_model, diarization_pipeline, interactive_mode=args.interactive
                 )
                 
                 if args.interactive and output_md_path_from_process:
