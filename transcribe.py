@@ -42,6 +42,11 @@ def format_timestamp(seconds: float) -> str:
     return str(timedelta(seconds=seconds))
 
 
+def sanitize_filename(name):
+    """Removes invalid characters from a string to make it a valid filename."""
+    return re.sub(r'[\\/*?:"<>|]', "", name)
+
+
 def apply_collar_fix(
     diarization: Annotation,
     collar_seconds: float = 0.5,
@@ -93,9 +98,6 @@ def fix_leading_unknowns(combined_result, time_threshold=0.5):
             and next_item["speaker"] != "UNKNOWN"
             and (next_item["start"] - current_item["end"]) < time_threshold
         ):
-            logging.info(
-                f"Leading Fix: Merging UNKNOWN '{current_item['text'].strip()}' into {next_item['speaker']}."
-            )
             current_item["speaker"] = next_item["speaker"]
 
     return combined_result
@@ -115,9 +117,6 @@ def fix_trailing_unknowns(combined_result, time_threshold=0.5):
             and prev_item["speaker"] != "UNKNOWN"
             and (current_item["start"] - prev_item["end"]) < time_threshold
         ):
-            logging.info(
-                f"Trailing Fix: Merging UNKNOWN '{current_item['text'].strip()}' into {prev_item['speaker']}."
-            )
             current_item["speaker"] = prev_item["speaker"]
 
     return combined_result
@@ -177,11 +176,10 @@ def format_final_transcript(combined_result):
     )
 
 
-def query_ollama(transcript_text, prompt_template):
-    """Sends a prompt with the transcript to Ollama and returns the response."""
+def query_ollama(prompt):
+    """Sends a prompt to Ollama and returns the response."""
     logging.info(f"Querying Ollama with model '{OLLAMA_MODEL}'...")
     try:
-        final_prompt = prompt_template.format(transcript=transcript_text)
         response = ollama.chat(
             model=OLLAMA_MODEL,
             messages=[
@@ -189,7 +187,7 @@ def query_ollama(transcript_text, prompt_template):
                     "role": "system",
                     "content": "You are an expert assistant for summarizing meeting transcripts.",
                 },
-                {"role": "user", "content": final_prompt},
+                {"role": "user", "content": prompt},
             ],
         )
         return response["message"]["content"]
@@ -198,27 +196,67 @@ def query_ollama(transcript_text, prompt_template):
         return "Error: Could not retrieve response from Ollama."
 
 
+def get_llm_title(transcript_text):
+    """Generates a descriptive filename title from a transcript using the LLM."""
+    logging.info("Generating descriptive title with LLM...")
+    prompt = f"""Based on the following transcript, generate a single, short, descriptive phrase of 4-8 words suitable for a filename.
+        - Do NOT use any special characters like quotes or colons.
+        - Do NOT explain your thinking.
+        - Provide ONLY the title phrase itself.
+
+        Example: Initial Project Kick-off with the Analytics Team
+
+        Here is the transcript:
+        ---
+        {transcript_text}
+        ---
+        """
+    title = query_ollama(prompt)
+    # Take only the first line of the response to be safe
+    clean_title = title.split('\n')[0].strip()
+    if len(title) > 100:
+        logging.info("Title too long, shortening")
+        shorten_prompt = f"""The following summary is far too long. Based on it, generate a single, short, descriptive phrase of 4-8 words suitable for a filename.
+            - Do NOT use any special characters like quotes or colons. 
+            - Do not generate markdown.
+            - Make the title meaningful, such as "Bill and John discussing pipelines".
+            - "Summary of the conversation" Is not meaningful so explain what the conversation is about.
+            - Do NOT explain your thinking.
+            - Provide ONLY the title phrase itself.
+
+            Example: Initial Project Kick-off with the Analytics Team
+
+            Here is the summary:
+            ---
+            {title}
+            ---
+            """
+
+    logging.info(f"Generated title: {clean_title}")
+    return sanitize_filename(clean_title)
+
+
 def get_llm_summaries(transcript_text):
     """
-    Generates a summary and action items from a transcript using the LLM.
+    Generates a summary and action items from a transcript using the LLM. Do not explain your thinking or mention the transcript.
     """
     logging.info("Generating summary and action items with LLM...")
-    summary_prompt_template = """Please provide a concise, professional summary of the following meeting transcript. Focus on the key decisions and outcomes.
+    summary_prompt = f"""Please provide a concise, professional summary of the following meeting transcript. Focus on the key decisions and outcomes. The summary should be short and only cover the main points. Do not explain your thinking or mention the transcript.
 
 Here is the transcript:
 ---
-{transcript}
+{transcript_text}
 ---
 """
-    action_items_prompt_template = """Based on the following transcript, extract all explicit action items. For each, identify the assigned person if mentioned. Format as a markdown list. If no action items are found, state that clearly.
+    action_items_prompt = f"""Based on the following transcript, extract all explicit action items. For each, identify the assigned person if mentioned. Format as a markdown list. If no action items are found, state that clearly. Do not explain your thinking or mention the transcript.
 
 Here is the transcript:
 ---
-{transcript}
+{transcript_text}
 ---
 """
-    summary = query_ollama(transcript_text, summary_prompt_template)
-    action_items = query_ollama(transcript_text, action_items_prompt_template)
+    summary = query_ollama(summary_prompt)
+    action_items = query_ollama(action_items_prompt)
     
     return summary, action_items
 
@@ -230,7 +268,7 @@ def process_audio_file(
     """
     Processes an audio file to generate a transcript markdown file.
     """
-    output_filename = os.path.splitext(filepath)[0] + ".md"
+    base_filepath = os.path.splitext(filepath)[0]
     logging.info(f"Starting full processing for: {os.path.basename(filepath)}")
 
     # 1. Transcription
@@ -262,8 +300,7 @@ def process_audio_file(
     combined_transcript = combine_transcription_and_diarization(
         transcription_chunks, diarization_fixed
     )
-
-    # Step 3a: Iterative cleanup of UNKNOWN segments (Restored)
+    
     max_cleanup_loops = 5
     logging.info("Step 3a: Starting iterative cleanup of UNKNOWN segments...")
     for i in range(max_cleanup_loops):
@@ -282,8 +319,12 @@ def process_audio_file(
     # 5. LLM Summarization
     summary, action_items = get_llm_summaries(formatted_transcript)
 
-    # 6. Write to File
-    logging.info(f"Step 6: Writing output to {os.path.basename(output_filename)}")
+    # 6. Generate Descriptive Filename
+    title = get_llm_title(formatted_transcript)
+    output_filename = f"{base_filepath} {title}.md"
+
+    # 7. Write to File
+    logging.info(f"Step 7: Writing output to {os.path.basename(output_filename)}")
     with open(output_filename, "w", encoding="utf-8") as f:
         f.write(f"# Meeting Notes: {os.path.basename(filepath)}\n\n")
         f.write(f"## Summary\n\n{summary}\n\n")
@@ -485,15 +526,28 @@ def main():
 
     for file_path in files_to_process:
         try:
-            output_md_path = os.path.splitext(file_path)[0] + ".md"
+            # Note: We can't know the final descriptive filename yet, so we look for a base .md file.
+            base_md_path = os.path.splitext(file_path)[0] + ".md"
 
-            if os.path.exists(output_md_path):
-                with open(output_md_path, 'r', encoding='utf-8') as f:
+            # This logic needs adjustment to find files with descriptive names.
+            # For now, we simplify and assume if a base .md exists, it's a candidate.
+            # A more robust solution might check for " 2*.md"
+            
+            # Simplified check: Find any .md file that starts with the base name
+            directory, base_name = os.path.split(os.path.splitext(file_path)[0])
+            existing_md_file = None
+            for f in os.listdir(directory or '.'):
+                if f.startswith(base_name) and f.endswith('.md'):
+                    existing_md_file = os.path.join(directory, f)
+                    break
+            
+            if existing_md_file:
+                with open(existing_md_file, 'r', encoding='utf-8') as f:
                     content = f.read()
                 is_already_named = "## Attendees" in content
 
                 if args.interactive and (not is_already_named or is_single_file_run):
-                    interactive_renaming(output_md_path)
+                    interactive_renaming(existing_md_file)
                 else:
                     logging.info(f"Skipping '{os.path.basename(file_path)}'; already processed and named.")
             
