@@ -224,20 +224,16 @@ def get_llm_summary_and_actions(transcript_text):
     Generates a summary and action items from a transcript in a single LLM call.
     """
     logging.info("Generating summary and action items with LLM...")
-    prompt = f"""Please provide a summary and action points (if any) for the following meeting transcript.
-Focus on the key decisions and outcomes.
-The summary should be short and cover the main points.
-For the action items, extract all explicit action items and identify the assigned person if mentioned. Format as a markdown list. If no action items are found, state that clearly.
-Your entire response MUST be in markdown format, starting with a '## Summary' section followed by an '## Action Items' section. For example:
+    prompt = f"""Your task is to generate a concise summary and a list of action items from the provided meeting transcript.
 
-## Summary
+First, write a '## Summary' of the key decisions and outcomes.
 
-The meeting was a discussion between Bill and Dave on pipeline observability. They concluded more work was needed.
+Second, write a separate '## Action Items' section.
+- Extract ALL explicit action items from the transcript.
+- For each action item, identify the person it was assigned to.
+- If no action items are found, explicitly state "No action items were identified."
 
-## Action Items
-
-* Document the current status (Assigned to Bill).
-* Set up a team meeting to discuss (Assigned to Dave).
+Format your entire response in markdown.
 
 Here is the transcript:
 ---
