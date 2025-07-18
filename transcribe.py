@@ -5,58 +5,98 @@ import torch
 import ollama
 from pyannote.audio import Pipeline
 from pyannote.core import Annotation
-import whisper # MODIFIED: Import the original OpenAI Whisper library
+import whisper
 from datetime import timedelta
 import logging
 
 # --- Configuration ---
-WHISPER_MODEL = "base.en" # Using '.en' model for English-only is often faster and more accurate
+WHISPER_MODEL = "base.en"
 DIARIZATION_MODEL = "pyannote/speaker-diarization-3.1"
-OLLAMA_MODEL = "gemma2:27b" # Updated to a more recent model
+OLLAMA_MODEL = "gemma2:27b"
 SUPPORTED_EXTENSIONS = [".mp3", ".wav", ".m4a", ".flac"]
 
+# --- Environment Setup ---
 from dotenv import load_dotenv
 load_dotenv()
 hf_api_key = os.getenv("HF_API_TOKEN")
 
-# Setup basic logging
+# --- Logging Setup ---
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 if hf_api_key:
     logging.info("Hugging Face API token loaded.")
 else:
     logging.warning("Hugging Face API token not found. Diarization may fail if model needs auth.")
 
+# --- Helper Functions ---
 
-def format_timestamp(seconds):
+def format_timestamp(seconds: float) -> str:
     """Converts seconds to a HH:MM:SS.mmm format."""
     return str(timedelta(seconds=seconds))
 
-def apply_collar_fix(diarization: Annotation, collar_seconds: float = 0.5, unknown_duration_s: float = 1.5):
-    """Applies a 'collar fix' to short, UNKNOWN speaker segments."""
-    if not diarization.uri:
+def apply_collar_fix(
+    diarization: Annotation,
+    collar_seconds: float = 0.5,
+    unknown_duration_threshold_s: float = 1.5,
+) -> Annotation:
+    """Corrects short, 'sandwiched' UNKNOWN segments."""
+    if not diarization.uri or len(diarization.labels()) == 0:
         return diarization
-    corrected_diarization = Annotation(uri=diarization.uri)
+
+    corrected_diarization = diarization.copy()
     turns = list(diarization.itertracks(yield_label=True))
     if len(turns) < 3:
-        for turn, track, speaker in turns:
-            corrected_diarization[turn, track] = speaker
-        return corrected_diarization
+        return diarization
 
-    modified_turns = list(turns)
     for i in range(1, len(turns) - 1):
+        prev_turn, _, prev_speaker = turns[i - 1]
         current_turn, _, current_speaker = turns[i]
-        prev_turn, _, prev_speaker = turns[i-1]
-        next_turn, _, next_speaker = turns[i+1]
-        is_short_unknown = "UNKNOWN" in current_speaker and current_turn.duration < unknown_duration_s
+        next_turn, _, next_speaker = turns[i + 1]
+
+        is_short_unknown = ("UNKNOWN" in current_speaker and current_turn.duration < unknown_duration_threshold_s)
         speakers_match = prev_speaker == next_speaker
-        is_within_collar = (current_turn.start - prev_turn.end) < collar_seconds and \
-                           (next_turn.start - current_turn.end) < collar_seconds
+        is_within_collar = ((current_turn.start - prev_turn.end) < collar_seconds and (next_turn.start - current_turn.end) < collar_seconds)
+
         if is_short_unknown and speakers_match and is_within_collar:
-            modified_turns[i] = (current_turn, modified_turns[i][1], prev_speaker)
-            logging.info(f"Applying collar fix: Re-labeling short UNKNOWN segment at {format_timestamp(current_turn.start)} to '{prev_speaker}'.")
-    for turn, track, speaker in modified_turns:
-        corrected_diarization[turn, track] = speaker
+            logging.info(f"Collar Fix: Re-labeling segment [{current_turn.start:.2f}s - {current_turn.end:.2f}s] from {current_speaker} to {prev_speaker}.")
+            corrected_diarization[current_turn] = prev_speaker
+
     return corrected_diarization.support()
+
+def fix_leading_unknowns(combined_result, time_threshold=0.5):
+    """Merges an UNKNOWN word with the subsequent speaker's turn if they are close in time."""
+    if len(combined_result) < 2:
+        return combined_result
+
+    for i in range(len(combined_result) - 1):
+        current_item = combined_result[i]
+        next_item = combined_result[i + 1]
+
+        if (current_item["speaker"] == "UNKNOWN" and
+            next_item["speaker"] != "UNKNOWN" and
+            (next_item["start"] - current_item["end"]) < time_threshold):
+            
+            logging.info(f"Leading Fix: Merging UNKNOWN '{current_item['text'].strip()}' into {next_item['speaker']}.")
+            current_item["speaker"] = next_item["speaker"]
+    
+    return combined_result
+
+def fix_trailing_unknowns(combined_result, time_threshold=0.5):
+    """Merges an UNKNOWN word with the preceding speaker's turn if they are close in time."""
+    if len(combined_result) < 2:
+        return combined_result
+
+    for i in range(len(combined_result) - 1, 0, -1):
+        current_item = combined_result[i]
+        prev_item = combined_result[i - 1]
+
+        if (current_item["speaker"] == "UNKNOWN" and
+            prev_item["speaker"] != "UNKNOWN" and
+            (current_item["start"] - prev_item["end"]) < time_threshold):
+            
+            logging.info(f"Trailing Fix: Merging UNKNOWN '{current_item['text'].strip()}' into {prev_item['speaker']}.")
+            current_item["speaker"] = prev_item["speaker"]
+
+    return combined_result
 
 def combine_transcription_and_diarization(transcription_chunks, diarization_result):
     """Merges Whisper's transcription with Pyannote's diarization."""
@@ -78,7 +118,6 @@ def combine_transcription_and_diarization(transcription_chunks, diarization_resu
                 speaker = turn["speaker"]
                 break
 
-        # Use .get() with a default to avoid errors if 'text' key is missing
         full_transcript.append({
             "start": word_start, "end": word_end,
             "text": chunk.get("text", ""), "speaker": speaker
@@ -115,19 +154,17 @@ def query_ollama(transcript_text, prompt_template):
         logging.error(f"Failed to query Ollama: {e}")
         return "Error: Could not retrieve response from Ollama."
 
+# --- Main Processing Logic ---
+
 def process_audio_file(filepath, whisper_model, diarization_pipeline):
     """Main processing function for a single audio file."""
     output_filename = os.path.splitext(filepath)[0] + ".md"
     logging.info(f"Starting processing for: {os.path.basename(filepath)}")
 
-    # 1. Transcription (MODIFIED: Using original OpenAI Whisper on CPU)
-    logging.info("Step 1: Transcribing audio with OpenAI Whisper on CPU...")
-    # The 'word_timestamps' option is crucial for speaker alignment
+    # 1. Transcription (Whisper on CPU)
+    logging.info("Step 1: Transcribing audio with OpenAI Whisper...")
     transcription_result = whisper_model.transcribe(filepath, word_timestamps=True, fp16=False)
 
-    # NEW: Adapt whisper's output to the format our script expects
-    # The original script expected {'text': ' word', 'timestamp': (start, end)}
-    # We will create that from the new output format.
     transcription_chunks = []
     for segment in transcription_result["segments"]:
         for word in segment["words"]:
@@ -137,25 +174,42 @@ def process_audio_file(filepath, whisper_model, diarization_pipeline):
                 "end": word["end"]
             })
 
-    # 2. Diarization (on GPU if available)
+    # 2. Diarization (Pyannote on GPU if available)
     logging.info("Step 2: Performing speaker diarization with Pyannote...")
     diarization_result = diarization_pipeline(filepath)
     diarization_fixed = apply_collar_fix(diarization_result)
 
-    # 3. Combine and Format
+    # 3. Combine and Clean
     logging.info("Step 3: Combining transcription and diarization...")
     combined_transcript = combine_transcription_and_diarization(transcription_chunks, diarization_fixed)
+
+    # --- Iterative Cleanup Loop ---
+    max_cleanup_loops = 5
+    logging.info("Starting iterative cleanup of UNKNOWN segments...")
+    for i in range(max_cleanup_loops):
+        initial_state = [item.copy() for item in combined_transcript]
+
+        combined_transcript = fix_leading_unknowns(combined_transcript)
+        combined_transcript = fix_trailing_unknowns(combined_transcript)
+        
+        if combined_transcript == initial_state:
+            logging.info(f"Transcript stabilized after {i + 1} cleanup loop(s).")
+            break
+    else:
+        logging.warning("Cleanup loop reached max iterations without stabilizing.")
+
+    # 4. Final Formatting
     formatted_transcript = format_final_transcript(combined_transcript)
 
-    # 4. LLM Summarization
-    logging.info("Step 4: Generating summary and action items with Ollama...")
+    # 5. LLM Summarization
+    logging.info("Step 5: Generating summary and action items with Ollama...")
     summary_prompt = "Please provide a concise, professional summary of the following meeting transcript. Focus on the key decisions and outcomes."
     action_items_prompt = "Based on the transcript, extract all explicit action items. For each, identify the assigned person if mentioned. Format as a markdown list."
     summary = query_ollama(formatted_transcript, summary_prompt)
     action_items = query_ollama(formatted_transcript, action_items_prompt)
 
-    # 5. Write to File
-    logging.info(f"Step 5: Writing output to {os.path.basename(output_filename)}")
+    # 6. Write to File
+    logging.info(f"Step 6: Writing output to {os.path.basename(output_filename)}")
     with open(output_filename, "w", encoding="utf-8") as f:
         f.write(f"# Meeting Notes: {os.path.basename(filepath)}\n\n")
         f.write(f"## Summary\n\n{summary}\n\n")
@@ -165,10 +219,10 @@ def process_audio_file(filepath, whisper_model, diarization_pipeline):
         f.write("\n")
     logging.info(f"Successfully processed {os.path.basename(filepath)}.")
 
-
 def main():
-    parser = argparse.ArgumentParser(description="Transcribe, diarize, and summarize audio files using Whisper and Pyannote.")
-    parser.add_argument("path", nargs='?', default=".", help="Path to an audio file or a folder containing audio files (defaults to current directory).")
+    """Main entry point for the script."""
+    parser = argparse.ArgumentParser(description="Transcribe, diarize, and summarize audio files.")
+    parser.add_argument("path", nargs='?', default=".", help="Path to an audio file or a folder (defaults to current directory).")
     args = parser.parse_args()
     input_path = args.path
 
@@ -176,31 +230,33 @@ def main():
         logging.error(f"Error: Path does not exist: {input_path}")
         sys.exit(1)
 
-    # --- MODIFIED: Multi-device loading strategy ---
+    # --- Multi-device loading strategy ---
     logging.info("Loading AI models...")
-
-    # Determine device for Pyannote (GPU if available, else CPU)
-    # Using torch.cuda.is_available() for broader GPU support (NVIDIA)
     if torch.cuda.is_available():
         pyannote_device = torch.device("cuda")
-    elif torch.backends.mps.is_available(): # For Apple Silicon
+    elif torch.backends.mps.is_available():
         pyannote_device = torch.device("mps")
     else:
         pyannote_device = torch.device("cpu")
     
-    # Whisper will always run on CPU as requested
     whisper_device = "cpu"
-    
     logging.info(f"Pyannote will run on: {pyannote_device}")
     logging.info(f"Whisper will run on: {whisper_device}")
 
     try:
-        # Load OpenAI Whisper model onto the CPU
-        # fp16=False is recommended for CPU-only operation.
         whisper_model = whisper.load_model(WHISPER_MODEL, device=whisper_device)
 
-        # Load Pyannote and move to its designated device
-        diarization_pipeline = Pipeline.from_pretrained(DIARIZATION_MODEL, use_auth_token=hf_api_key)
+        # Define hyperparameters to reduce segmentation fragmentation
+        hyperparameters = {
+            "min_duration_on": 0.1,
+            "onset": 0.7,
+        }
+        
+        diarization_pipeline = Pipeline.from_pretrained(
+            DIARIZATION_MODEL, 
+            use_auth_token=hf_api_key
+        )
+        diarization_pipeline.segmentation.hyperparameters = hyperparameters
         diarization_pipeline.to(pyannote_device)
 
     except Exception as e:
@@ -209,6 +265,7 @@ def main():
 
     logging.info("Models loaded successfully.")
 
+    # --- File Processing ---
     if os.path.isfile(input_path):
         if os.path.splitext(input_path)[1].lower() in SUPPORTED_EXTENSIONS:
             process_audio_file(input_path, whisper_model, diarization_pipeline)
@@ -217,10 +274,9 @@ def main():
             sys.exit(1)
     elif os.path.isdir(input_path):
         logging.info(f"Processing all supported audio files in folder: {input_path}")
-        for filename in sorted(os.listdir(input_path)): # sorted for deterministic order
+        for filename in sorted(os.listdir(input_path)):
             file_path = os.path.join(input_path, filename)
             if os.path.isfile(file_path) and os.path.splitext(filename)[1].lower() in SUPPORTED_EXTENSIONS:
-                # Check if output already exists
                 output_md_path = os.path.splitext(file_path)[0] + ".md"
                 if os.path.exists(output_md_path):
                     logging.info(f"Skipping '{filename}': Output file already exists.")
@@ -229,8 +285,6 @@ def main():
                     process_audio_file(file_path, whisper_model, diarization_pipeline)
                 except Exception as e:
                     logging.error(f"Failed to process {filename}: {e}", exc_info=True)
-            else:
-                logging.warning(f"Skipping non-supported file or sub-directory: {filename}")
 
 if __name__ == "__main__":
     main()
