@@ -445,7 +445,7 @@ def interactive_renaming(md_filepath):
         final_content = final_content.replace("\n\n---", f"\n\n{attendees_section}---")
 
     new_title = get_llm_title(new_summary_section)
-    base_filepath = os.path.splitext(md_filepath)[0].split(' ')[0] 
+    base_filepath = os.path.splitext(md_filepath)[0]
     new_filepath = f"{base_filepath} {new_title}.md"
 
     with open(new_filepath, 'w', encoding='utf-8') as f:
