@@ -1,5 +1,6 @@
 import os
 import sys
+import re
 import argparse
 import logging
 from datetime import timedelta
@@ -15,11 +16,10 @@ from pyannote.audio.core.io import Audio
 # --- Configuration ---
 WHISPER_MODEL = "base.en"
 DIARIZATION_MODEL = "pyannote/speaker-diarization-3.1"
-OLLAMA_MODEL = "gemma2:27b"
+OLLAMA_MODEL = "gemma3:27b"
 SUPPORTED_EXTENSIONS = [".mp3", ".wav", ".m4a", ".flac"]
 
 # --- Environment Setup ---
-
 load_dotenv()
 hf_api_key = os.getenv("HF_API_TOKEN")
 
@@ -40,23 +40,6 @@ else:
 def format_timestamp(seconds: float) -> str:
     """Converts seconds to a HH:MM:SS.mmm format."""
     return str(timedelta(seconds=seconds))
-
-
-def generate_speaker_hint(speaker_label, transcript_data, max_words=25):
-    """
-    Generates a text snippet from the first turn of a given speaker to use as a hint.
-    """
-    hint_words = []
-    # Find the first instance of the speaker and start collecting their words
-    for i, item in enumerate(transcript_data):
-        if item["speaker"] == speaker_label:
-            # We found the first word, now collect the following words from the same speaker
-            for j in range(0, 3):
-                follow_up_item = transcript_data[j]
-                hint_words.append(follow_up_item["text"].strip())
-            break  # Exit the outer loop once the first turn is processed
-
-    return " \n".join(hint_words)
 
 
 def apply_collar_fix(
@@ -110,7 +93,6 @@ def fix_leading_unknowns(combined_result, time_threshold=0.5):
             and next_item["speaker"] != "UNKNOWN"
             and (next_item["start"] - current_item["end"]) < time_threshold
         ):
-
             logging.info(
                 f"Leading Fix: Merging UNKNOWN '{current_item['text'].strip()}' into {next_item['speaker']}."
             )
@@ -133,7 +115,6 @@ def fix_trailing_unknowns(combined_result, time_threshold=0.5):
             and prev_item["speaker"] != "UNKNOWN"
             and (current_item["start"] - prev_item["end"]) < time_threshold
         ):
-
             logging.info(
                 f"Trailing Fix: Merging UNKNOWN '{current_item['text'].strip()}' into {prev_item['speaker']}."
             )
@@ -200,6 +181,7 @@ def query_ollama(transcript_text, prompt_template):
     """Sends a prompt with the transcript to Ollama and returns the response."""
     logging.info(f"Querying Ollama with model '{OLLAMA_MODEL}'...")
     try:
+        final_prompt = prompt_template.format(transcript=transcript_text)
         response = ollama.chat(
             model=OLLAMA_MODEL,
             messages=[
@@ -207,10 +189,7 @@ def query_ollama(transcript_text, prompt_template):
                     "role": "system",
                     "content": "You are an expert assistant for summarizing meeting transcripts.",
                 },
-                {
-                    "role": "user",
-                    "content": prompt_template.format(transcript=transcript_text),
-                },
+                {"role": "user", "content": final_prompt},
             ],
         )
         return response["message"]["content"]
@@ -219,15 +198,40 @@ def query_ollama(transcript_text, prompt_template):
         return "Error: Could not retrieve response from Ollama."
 
 
+def get_llm_summaries(transcript_text):
+    """
+    Generates a summary and action items from a transcript using the LLM.
+    """
+    logging.info("Generating summary and action items with LLM...")
+    summary_prompt_template = """Please provide a concise, professional summary of the following meeting transcript. Focus on the key decisions and outcomes.
+
+Here is the transcript:
+---
+{transcript}
+---
+"""
+    action_items_prompt_template = """Based on the following transcript, extract all explicit action items. For each, identify the assigned person if mentioned. Format as a markdown list. If no action items are found, state that clearly.
+
+Here is the transcript:
+---
+{transcript}
+---
+"""
+    summary = query_ollama(transcript_text, summary_prompt_template)
+    action_items = query_ollama(transcript_text, action_items_prompt_template)
+    
+    return summary, action_items
+
 # --- Main Processing Logic ---
 
-
 def process_audio_file(
-    filepath, whisper_model, diarization_pipeline, interactive=False
+    filepath, whisper_model, diarization_pipeline
 ):
-    """Main processing function for a single audio file."""
+    """
+    Processes an audio file to generate a transcript markdown file.
+    """
     output_filename = os.path.splitext(filepath)[0] + ".md"
-    logging.info(f"Starting processing for: {os.path.basename(filepath)}")
+    logging.info(f"Starting full processing for: {os.path.basename(filepath)}")
 
     # 1. Transcription
     logging.info("Step 1: Transcribing audio...")
@@ -243,7 +247,14 @@ def process_audio_file(
 
     # 2. Diarization
     logging.info("Step 2: Performing speaker diarization...")
-    diarization_result = diarization_pipeline(filepath)
+    try:
+        audio_loader = Audio(sample_rate=16000, mono=True)
+        waveform, sample_rate = audio_loader(filepath)
+        diarization_result = diarization_pipeline({"waveform": waveform, "sample_rate": sample_rate})
+    except Exception as e:
+        logging.error(f"Error during diarization: {e}", exc_info=True)
+        diarization_result = Annotation()
+
     diarization_fixed = apply_collar_fix(diarization_result)
 
     # 3. Combine and Clean
@@ -251,7 +262,8 @@ def process_audio_file(
     combined_transcript = combine_transcription_and_diarization(
         transcription_chunks, diarization_fixed
     )
-
+    
+    # Step 3a: Iterative cleanup of UNKNOWN segments (restored)
     max_cleanup_loops = 5
     logging.info("Step 3a: Starting iterative cleanup of UNKNOWN segments...")
     for i in range(max_cleanup_loops):
@@ -264,51 +276,14 @@ def process_audio_file(
     else:
         logging.warning("Cleanup loop reached max iterations without stabilizing.")
 
-    # 4. Interactive Speaker Naming (if flag is set)
-    if interactive:
-        name_map = {}
-        speaker_labels = sorted(
-            list(
-                set(
-                    item["speaker"]
-                    for item in combined_transcript
-                    if item["speaker"] != "UNKNOWN"
-                )
-            )
-        )
-        if speaker_labels:
-            print("\n--- Assign Speaker Names ---")
-            for label in speaker_labels:
-                # Generate a longer, more helpful hint for identifying the speaker
-                hint_snippet = generate_speaker_hint(
-                    label, combined_transcript, max_words=25
-                )
-
-                print(f"\nWho is {label}?")
-                print(f'  Hint: "{hint_snippet}..."')
-                new_name = input(f"Enter name for {label}: ")
-
-                if new_name:
-                    name_map[label] = new_name.strip()
-
-        if name_map:
-            for item in combined_transcript:
-                if item["speaker"] in name_map:
-                    item["speaker"] = name_map[item["speaker"]]
-            logging.info(f"Applied new speaker names: {name_map}")
-
-    # 5. Final Formatting
+    # 4. Final Formatting
     formatted_transcript = format_final_transcript(combined_transcript)
 
-    # 6. LLM Summarization
-    logging.info("Step 6: Generating summary and action items...")
-    summary_prompt = "Please provide a concise, professional summary of the following meeting transcript. Focus on the key decisions and outcomes."
-    action_items_prompt = "Based on the transcript, extract all explicit action items. For each, identify the assigned person if mentioned. Format as a markdown list."
-    summary = query_ollama(formatted_transcript, summary_prompt)
-    action_items = query_ollama(formatted_transcript, action_items_prompt)
+    # 5. LLM Summarization
+    summary, action_items = get_llm_summaries(formatted_transcript)
 
-    # 7. Write to File
-    logging.info(f"Step 7: Writing output to {os.path.basename(output_filename)}")
+    # 6. Write to File
+    logging.info(f"Step 6: Writing output to {os.path.basename(output_filename)}")
     with open(output_filename, "w", encoding="utf-8") as f:
         f.write(f"# Meeting Notes: {os.path.basename(filepath)}\n\n")
         f.write(f"## Summary\n\n{summary}\n\n")
@@ -316,7 +291,124 @@ def process_audio_file(
         f.write("---\n\n## Full Transcript\n\n")
         f.write(formatted_transcript)
         f.write("\n")
-    logging.info(f"Successfully processed {os.path.basename(filepath)}.")
+    logging.info(f"Successfully created base transcript for {os.path.basename(filepath)}.")
+    
+    return output_filename
+
+
+# --- Interactive Naming Logic ---
+
+def parse_md_transcript(content):
+    """Parses the markdown transcript to extract speaker turns."""
+    turn_pattern = re.compile(r"\[.*?\] \*\*(SPEAKER_\d+|UNKNOWN)\*\*:(.*)")
+    lines = content.split('\n')
+    turns = []
+    for line in lines:
+        match = turn_pattern.match(line)
+        if match:
+            turns.append({"speaker": match.group(1), "text": match.group(2).strip()})
+    return turns
+
+def generate_speaker_hint_from_turns(speaker_label, turns, start_turn=0, context_turns=1):
+    """Generates a conversational hint from a list of turns."""
+    occurrence_index = -1
+    for i in range(start_turn, len(turns)):
+        if turns[i]["speaker"] == speaker_label:
+            occurrence_index = i
+            break
+            
+    if occurrence_index == -1:
+        return None, -1
+        
+    start = max(0, occurrence_index - context_turns)
+    end = min(len(turns), occurrence_index + context_turns + 1)
+    
+    hint_lines = []
+    for i in range(start, end):
+        turn = turns[i]
+        speaker = turn['speaker']
+        text = turn['text']
+        display_speaker = f"**{speaker}**" if speaker == speaker_label else speaker
+        hint_lines.append(f"    {display_speaker}: {text}")
+        
+    return "\n".join(hint_lines), occurrence_index
+
+
+def interactive_renaming(md_filepath):
+    """Handles the interactive speaker renaming process, including re-running summaries."""
+    logging.info(f"Starting interactive renaming for {os.path.basename(md_filepath)}...")
+    
+    with open(md_filepath, 'r', encoding='utf-8') as f:
+        content = f.read()
+
+    transcript_section = content.split("## Full Transcript\n\n")[-1]
+    turns = parse_md_transcript(transcript_section)
+    
+    speaker_labels = sorted(list(set(turn["speaker"] for turn in turns if turn["speaker"] != "UNKNOWN")))
+    
+    name_map = {}
+    if not speaker_labels:
+        logging.info("No generic speakers found to rename.")
+        return
+
+    print("\n--- Assign Speaker Names ---")
+    skip_all = False
+    for label in speaker_labels:
+        search_from_turn = 0
+        while True:
+            hint, found_at = generate_speaker_hint_from_turns(label, turns, start_turn=search_from_turn)
+            if not hint:
+                print(f"\nNo more occurrences of {label} found.")
+                break
+
+            print(f"\n--- Who is {label}? (Press Enter for next hint) ---")
+            print("  Context:")
+            print(hint)
+            
+            new_name = input(f"Enter name for {label} (or type 'SKIP'): ")
+
+            if new_name.lower() == 'skip':
+                skip_all = True
+                break
+            elif new_name:
+                name_map[label] = new_name.strip()
+                break
+            else:
+                search_from_turn = found_at + 1
+        if skip_all:
+            break
+            
+    if not name_map:
+        logging.info("No names were assigned. File remains unchanged.")
+        return
+
+    logging.info(f"Applying new names: {name_map}")
+    updated_content = content
+    for old_label, new_name in name_map.items():
+        updated_content = updated_content.replace(f"**{old_label}**", f"**{new_name}**")
+
+    named_transcript_text = updated_content.split("## Full Transcript\n\n")[-1]
+    
+    new_summary, new_action_items = get_llm_summaries(named_transcript_text)
+
+    # Replace old summary/actions with new content using regex
+    final_content = re.sub(
+        r"(## Summary\n\n)(.*?)(\n\n## Action Items)",
+        f"\\1{new_summary}\\3",
+        updated_content,
+        flags=re.DOTALL
+    )
+    final_content = re.sub(
+        r"(## Action Items\n\n)(.*?)(\n\n---)",
+        f"\\1{new_action_items}\\3",
+        final_content,
+        flags=re.DOTALL
+    )
+
+    with open(md_filepath, 'w', encoding='utf-8') as f:
+        f.write(final_content)
+    
+    logging.info(f"Successfully updated speaker names and summaries in {os.path.basename(md_filepath)}.")
 
 
 def main():
@@ -333,7 +425,7 @@ def main():
     parser.add_argument(
         "--interactive",
         action="store_true",
-        help="Prompt for speaker names interactively during processing.",
+        help="After processing, or if an output file exists, prompt for speaker names.",
     )
     args = parser.parse_args()
 
@@ -368,38 +460,36 @@ def main():
     logging.info("Models loaded successfully.")
 
     # --- File Processing ---
+    files_to_process = []
     if os.path.isfile(args.path):
         if os.path.splitext(args.path)[1].lower() in SUPPORTED_EXTENSIONS:
-            process_audio_file(
-                args.path, whisper_model, diarization_pipeline, args.interactive
-            )
+            files_to_process.append(args.path)
         else:
-            logging.error(
-                f"Unsupported file type: {args.path}. Supported are: {SUPPORTED_EXTENSIONS}"
-            )
+            logging.error(f"Unsupported file type: {args.path}. Supported are: {SUPPORTED_EXTENSIONS}")
             sys.exit(1)
     elif os.path.isdir(args.path):
-        logging.info(f"Processing all supported audio files in folder: {args.path}")
         for filename in sorted(os.listdir(args.path)):
             file_path = os.path.join(args.path, filename)
-            if (
-                os.path.isfile(file_path)
-                and os.path.splitext(filename)[1].lower() in SUPPORTED_EXTENSIONS
-            ):
-                output_md_path = os.path.splitext(file_path)[0] + ".md"
-                if os.path.exists(output_md_path):
-                    logging.info(f"Skipping '{filename}': Output file already exists.")
-                    continue
-                try:
-                    process_audio_file(
-                        file_path, whisper_model, diarization_pipeline, args.interactive
-                    )
-                except Exception as e:
-                    logging.error(f"Failed to process {filename}: {e}", exc_info=True)
+            if (os.path.isfile(file_path) and os.path.splitext(filename)[1].lower() in SUPPORTED_EXTENSIONS):
+                files_to_process.append(file_path)
+
+    for file_path in files_to_process:
+        try:
+            output_md_path = os.path.splitext(file_path)[0] + ".md"
+
+            if args.interactive and os.path.exists(output_md_path):
+                interactive_renaming(output_md_path)
+            
             else:
-                logging.warning(
-                    f"Skipping non-supported file or sub-directory: {filename}"
+                output_md_path_from_process = process_audio_file(
+                    file_path, whisper_model, diarization_pipeline
                 )
+                
+                if args.interactive and output_md_path_from_process:
+                    interactive_renaming(output_md_path_from_process)
+
+        except Exception as e:
+            logging.error(f"Failed to process {os.path.basename(file_path)}: {e}", exc_info=True)
 
 
 if __name__ == "__main__":
