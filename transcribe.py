@@ -262,8 +262,8 @@ def process_audio_file(
     combined_transcript = combine_transcription_and_diarization(
         transcription_chunks, diarization_fixed
     )
-    
-    # Step 3a: Iterative cleanup of UNKNOWN segments (restored)
+
+    # Step 3a: Iterative cleanup of UNKNOWN segments (Restored)
     max_cleanup_loops = 5
     logging.info("Step 3a: Starting iterative cleanup of UNKNOWN segments...")
     for i in range(max_cleanup_loops):
@@ -344,11 +344,11 @@ def interactive_renaming(md_filepath):
     transcript_section = content.split("## Full Transcript\n\n")[-1]
     turns = parse_md_transcript(transcript_section)
     
-    speaker_labels = sorted(list(set(turn["speaker"] for turn in turns if turn["speaker"] != "UNKNOWN")))
+    speaker_labels = sorted(list(set(turn["speaker"] for turn in turns if "SPEAKER" in turn["speaker"])))
     
     name_map = {}
     if not speaker_labels:
-        logging.info("No generic speakers found to rename.")
+        logging.info("No generic speakers found to rename in this file.")
         return
 
     print("\n--- Assign Speaker Names ---")
@@ -391,7 +391,7 @@ def interactive_renaming(md_filepath):
     
     new_summary, new_action_items = get_llm_summaries(named_transcript_text)
 
-    # Replace old summary/actions with new content using regex
+    # Replace old summary/actions and add attendees section
     final_content = re.sub(
         r"(## Summary\n\n)(.*?)(\n\n## Action Items)",
         f"\\1{new_summary}\\3",
@@ -404,6 +404,14 @@ def interactive_renaming(md_filepath):
         final_content,
         flags=re.DOTALL
     )
+
+    attendees_list = "\n".join(f"* {name}" for name in sorted(name_map.values()))
+    attendees_section = f"## Attendees\n\n{attendees_list}\n\n"
+    
+    if "## Attendees" in final_content:
+        final_content = re.sub(r"(## Attendees\n\n)(.*?)(\n\n---)", f"\\1{attendees_list}\\3", final_content, flags=re.DOTALL)
+    else:
+        final_content = final_content.replace("\n\n---", f"\n\n{attendees_section}---")
 
     with open(md_filepath, 'w', encoding='utf-8') as f:
         f.write(final_content)
@@ -473,12 +481,21 @@ def main():
             if (os.path.isfile(file_path) and os.path.splitext(filename)[1].lower() in SUPPORTED_EXTENSIONS):
                 files_to_process.append(file_path)
 
+    is_single_file_run = os.path.isfile(args.path)
+
     for file_path in files_to_process:
         try:
             output_md_path = os.path.splitext(file_path)[0] + ".md"
 
-            if args.interactive and os.path.exists(output_md_path):
-                interactive_renaming(output_md_path)
+            if os.path.exists(output_md_path):
+                with open(output_md_path, 'r', encoding='utf-8') as f:
+                    content = f.read()
+                is_already_named = "## Attendees" in content
+
+                if args.interactive and (not is_already_named or is_single_file_run):
+                    interactive_renaming(output_md_path)
+                else:
+                    logging.info(f"Skipping '{os.path.basename(file_path)}'; already processed and named.")
             
             else:
                 output_md_path_from_process = process_audio_file(
