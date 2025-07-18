@@ -33,6 +33,22 @@ def format_timestamp(seconds: float) -> str:
     """Converts seconds to a HH:MM:SS.mmm format."""
     return str(timedelta(seconds=seconds))
 
+def generate_speaker_hint(speaker_label, transcript_data, max_words=25):
+    """
+    Generates a text snippet from the first turn of a given speaker to use as a hint.
+    """
+    hint_words = []
+    # Find the first instance of the speaker and start collecting their words
+    for i, item in enumerate(transcript_data):
+        if item['speaker'] == speaker_label:
+            # We found the first word, now collect the following words from the same speaker
+            for j in range(0,3):
+                follow_up_item = transcript_data[j]
+                hint_words.append(follow_up_item['text'].strip())
+            break # Exit the outer loop once the first turn is processed
+    
+    return " \n".join(hint_words)
+
 def apply_collar_fix(
     diarization: Annotation,
     collar_seconds: float = 0.5,
@@ -156,26 +172,21 @@ def query_ollama(transcript_text, prompt_template):
 
 # --- Main Processing Logic ---
 
-def process_audio_file(filepath, whisper_model, diarization_pipeline):
+def process_audio_file(filepath, whisper_model, diarization_pipeline, interactive=False):
     """Main processing function for a single audio file."""
     output_filename = os.path.splitext(filepath)[0] + ".md"
     logging.info(f"Starting processing for: {os.path.basename(filepath)}")
 
-    # 1. Transcription (Whisper on CPU)
-    logging.info("Step 1: Transcribing audio with OpenAI Whisper...")
+    # 1. Transcription
+    logging.info("Step 1: Transcribing audio...")
     transcription_result = whisper_model.transcribe(filepath, word_timestamps=True, fp16=False)
-
     transcription_chunks = []
     for segment in transcription_result["segments"]:
         for word in segment["words"]:
-            transcription_chunks.append({
-                "text": word["word"],
-                "start": word["start"],
-                "end": word["end"]
-            })
+            transcription_chunks.append({"text": word["word"], "start": word["start"], "end": word["end"]})
 
-    # 2. Diarization (Pyannote on GPU if available)
-    logging.info("Step 2: Performing speaker diarization with Pyannote...")
+    # 2. Diarization
+    logging.info("Step 2: Performing speaker diarization...")
     diarization_result = diarization_pipeline(filepath)
     diarization_fixed = apply_collar_fix(diarization_result)
 
@@ -183,33 +194,53 @@ def process_audio_file(filepath, whisper_model, diarization_pipeline):
     logging.info("Step 3: Combining transcription and diarization...")
     combined_transcript = combine_transcription_and_diarization(transcription_chunks, diarization_fixed)
 
-    # --- Iterative Cleanup Loop ---
     max_cleanup_loops = 5
-    logging.info("Starting iterative cleanup of UNKNOWN segments...")
+    logging.info("Step 3a: Starting iterative cleanup of UNKNOWN segments...")
     for i in range(max_cleanup_loops):
         initial_state = [item.copy() for item in combined_transcript]
-
         combined_transcript = fix_leading_unknowns(combined_transcript)
         combined_transcript = fix_trailing_unknowns(combined_transcript)
-        
         if combined_transcript == initial_state:
             logging.info(f"Transcript stabilized after {i + 1} cleanup loop(s).")
             break
     else:
         logging.warning("Cleanup loop reached max iterations without stabilizing.")
 
-    # 4. Final Formatting
+    # 4. Interactive Speaker Naming (if flag is set)
+    if interactive:
+        name_map = {}
+        speaker_labels = sorted(list(set(item['speaker'] for item in combined_transcript if item['speaker'] != "UNKNOWN")))
+        if speaker_labels:
+            print("\n--- Assign Speaker Names ---")
+            for label in speaker_labels:
+                # Generate a longer, more helpful hint for identifying the speaker
+                hint_snippet = generate_speaker_hint(label, combined_transcript, max_words=25)
+                
+                print(f"\nWho is {label}?")
+                print(f"  Hint: \"{hint_snippet}...\"")
+                new_name = input(f"Enter name for {label}: ")
+
+                if new_name:
+                    name_map[label] = new_name.strip()
+
+        if name_map:
+            for item in combined_transcript:
+                if item['speaker'] in name_map:
+                    item['speaker'] = name_map[item['speaker']]
+            logging.info(f"Applied new speaker names: {name_map}")
+
+    # 5. Final Formatting
     formatted_transcript = format_final_transcript(combined_transcript)
 
-    # 5. LLM Summarization
-    logging.info("Step 5: Generating summary and action items with Ollama...")
+    # 6. LLM Summarization
+    logging.info("Step 6: Generating summary and action items...")
     summary_prompt = "Please provide a concise, professional summary of the following meeting transcript. Focus on the key decisions and outcomes."
     action_items_prompt = "Based on the transcript, extract all explicit action items. For each, identify the assigned person if mentioned. Format as a markdown list."
     summary = query_ollama(formatted_transcript, summary_prompt)
     action_items = query_ollama(formatted_transcript, action_items_prompt)
 
-    # 6. Write to File
-    logging.info(f"Step 6: Writing output to {os.path.basename(output_filename)}")
+    # 7. Write to File
+    logging.info(f"Step 7: Writing output to {os.path.basename(output_filename)}")
     with open(output_filename, "w", encoding="utf-8") as f:
         f.write(f"# Meeting Notes: {os.path.basename(filepath)}\n\n")
         f.write(f"## Summary\n\n{summary}\n\n")
@@ -223,14 +254,14 @@ def main():
     """Main entry point for the script."""
     parser = argparse.ArgumentParser(description="Transcribe, diarize, and summarize audio files.")
     parser.add_argument("path", nargs='?', default=".", help="Path to an audio file or a folder (defaults to current directory).")
+    parser.add_argument("--interactive", action="store_true", help="Prompt for speaker names interactively during processing.")
     args = parser.parse_args()
-    input_path = args.path
 
-    if not os.path.exists(input_path):
-        logging.error(f"Error: Path does not exist: {input_path}")
+    if not os.path.exists(args.path):
+        logging.error(f"Error: Path does not exist: {args.path}")
         sys.exit(1)
 
-    # --- Multi-device loading strategy ---
+    # --- Model Loading ---
     logging.info("Loading AI models...")
     if torch.cuda.is_available():
         pyannote_device = torch.device("cuda")
@@ -245,46 +276,37 @@ def main():
 
     try:
         whisper_model = whisper.load_model(WHISPER_MODEL, device=whisper_device)
-
-        # Define hyperparameters to reduce segmentation fragmentation
-        hyperparameters = {
-            "min_duration_on": 0.1,
-            "onset": 0.7,
-        }
-        
-        diarization_pipeline = Pipeline.from_pretrained(
-            DIARIZATION_MODEL, 
-            use_auth_token=hf_api_key
-        )
+        hyperparameters = {"min_duration_on": 0.1, "onset": 0.7}
+        diarization_pipeline = Pipeline.from_pretrained(DIARIZATION_MODEL, use_auth_token=hf_api_key)
         diarization_pipeline.segmentation.hyperparameters = hyperparameters
         diarization_pipeline.to(pyannote_device)
-
     except Exception as e:
         logging.error(f"Failed to load models: {e}", exc_info=True)
         sys.exit(1)
-
     logging.info("Models loaded successfully.")
 
     # --- File Processing ---
-    if os.path.isfile(input_path):
-        if os.path.splitext(input_path)[1].lower() in SUPPORTED_EXTENSIONS:
-            process_audio_file(input_path, whisper_model, diarization_pipeline)
+    if os.path.isfile(args.path):
+        if os.path.splitext(args.path)[1].lower() in SUPPORTED_EXTENSIONS:
+            process_audio_file(args.path, whisper_model, diarization_pipeline, args.interactive)
         else:
-            logging.error(f"Unsupported file type: {input_path}. Supported are: {SUPPORTED_EXTENSIONS}")
+            logging.error(f"Unsupported file type: {args.path}. Supported are: {SUPPORTED_EXTENSIONS}")
             sys.exit(1)
-    elif os.path.isdir(input_path):
-        logging.info(f"Processing all supported audio files in folder: {input_path}")
-        for filename in sorted(os.listdir(input_path)):
-            file_path = os.path.join(input_path, filename)
+    elif os.path.isdir(args.path):
+        logging.info(f"Processing all supported audio files in folder: {args.path}")
+        for filename in sorted(os.listdir(args.path)):
+            file_path = os.path.join(args.path, filename)
             if os.path.isfile(file_path) and os.path.splitext(filename)[1].lower() in SUPPORTED_EXTENSIONS:
                 output_md_path = os.path.splitext(file_path)[0] + ".md"
                 if os.path.exists(output_md_path):
                     logging.info(f"Skipping '{filename}': Output file already exists.")
                     continue
                 try:
-                    process_audio_file(file_path, whisper_model, diarization_pipeline)
+                    process_audio_file(file_path, whisper_model, diarization_pipeline, args.interactive)
                 except Exception as e:
                     logging.error(f"Failed to process {filename}: {e}", exc_info=True)
+            else:
+                logging.warning(f"Skipping non-supported file or sub-directory: {filename}")
 
 if __name__ == "__main__":
     main()

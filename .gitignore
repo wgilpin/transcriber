@@ -15,3 +15,6 @@ wheels/
 *.md
 .env
 .venv
+*.tmk
+
+.DS_Store
