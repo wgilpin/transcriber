@@ -173,7 +173,7 @@ def format_final_transcript(combined_result):
         current_line += item["text"]
     if current_line:
         output_lines.append(current_line)
-    return "\n".join(
+    return "\n\n".join(
         line.replace(" :", ":").replace(" ,", ",").replace(" .", ".")
         for line in output_lines
     )
@@ -515,7 +515,7 @@ def main():
     is_single_file_run = os.path.isfile(args.path)
 
     for file_path in files_to_process:
-        logging.info("---")
+        print("\n\n")
         logging.info(f"Processing file: {os.path.basename(file_path)}")
         try:
             directory, base_name = os.path.split(os.path.splitext(file_path)[0])
