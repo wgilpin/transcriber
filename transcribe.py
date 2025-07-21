@@ -159,7 +159,9 @@ def combine_transcription_and_diarization(transcription_chunks, diarization_resu
 
 
 def format_final_transcript(combined_result):
-    """Formats the combined transcript into a readable, speaker-labeled string."""
+    """Formats the combined transcript into a readable, speaker-labeled string, merging consecutive utterances from the same speaker."""
+    # This first block groups words into lines based on speaker changes.
+    # It can sometimes create separate consecutive lines for the same speaker if there are long pauses.
     output_lines = []
     current_speaker = None
     current_line = ""
@@ -173,11 +175,50 @@ def format_final_transcript(combined_result):
         current_line += item["text"]
     if current_line:
         output_lines.append(current_line)
+
+    if not output_lines:
+        return ""
+
+    # --- Post-processing step to merge consecutive lines from the same speaker ---
+    merged_lines = []
+    speaker_regex = re.compile(r"\[.*?\] \*\*(.*?)\*\*:")
+
+    for line in output_lines:
+        match = speaker_regex.search(line)
+        # If a line doesn't have a speaker tag, treat it as a continuation of the previous line.
+        if not match:
+            if merged_lines:
+                merged_lines[-1] += f" {line.strip()}"
+            else:
+                merged_lines.append(line)
+            continue
+
+        current_speaker_name = match.group(1)
+        text_content = line[match.end():]
+
+        # Check the last line in our merged list.
+        if not merged_lines:
+            merged_lines.append(line)
+            continue
+            
+        last_line = merged_lines[-1]
+        last_speaker_match = speaker_regex.search(last_line)
+
+        # If the last line has a speaker, it's the same as the current one, AND the speaker is not UNKNOWN, then merge.
+        if (last_speaker_match 
+                and last_speaker_match.group(1) == current_speaker_name 
+                and current_speaker_name != "UNKNOWN"):
+            # Append the text content of the current line to the end of the last line.
+            merged_lines[-1] += text_content
+        else:
+            # Otherwise, this is a new speaker (or UNKNOWN), so add the new line as is.
+            merged_lines.append(line)
+            
+    # Perform final cleanup on the now-merged lines.
     return "\n\n".join(
         line.replace(" :", ":").replace(" ,", ",").replace(" .", ".")
-        for line in output_lines
+        for line in merged_lines
     )
-
 
 def query_ollama(prompt):
     """Sends a prompt to Ollama and returns the response."""
@@ -524,7 +565,6 @@ def main():
 
     for file_path in files_to_process:
         print("\n\n")
-        logging.info(f"Processing file: {os.path.basename(file_path)}")
         try:
             directory, base_name = os.path.split(os.path.splitext(file_path)[0])
             directory = directory or '.'
@@ -542,8 +582,6 @@ def main():
 
                 if args.interactive and (not is_already_named or is_single_file_run):
                     interactive_renaming(existing_md_file)
-                else:
-                    logging.info(f"Skipping '{os.path.basename(file_path)}'; already processed and named.")
             
             else:
                 output_md_path_from_process = process_audio_file(
