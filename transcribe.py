@@ -477,7 +477,9 @@ def interactive_renaming(md_filepath):
         flags=re.DOTALL
     )
 
-    attendees_list = "\n".join(f"* {name}" for name in sorted(name_map.values()))
+    # Get a unique, sorted list of the actual speaker names
+    unique_attendees = sorted(list(set(name_map.values())))
+    attendees_list = "\n".join(f"* {name}" for name in unique_attendees)
     attendees_section = f"## Attendees\n\n{attendees_list}\n\n"
     
     if "## Attendees" in final_content:
