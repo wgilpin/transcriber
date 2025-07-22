@@ -24,3 +24,4 @@ wheels/
 *.tmk
 
 .DS_Store
+uv.lock

@@ -13,6 +13,8 @@ from pyannote.audio import Pipeline
 from pyannote.core import Annotation
 from pyannote.audio.core.io import Audio
 
+from colorama import Fore, Back, Style
+
 # --- Configuration ---
 WHISPER_MODEL = "base.en"
 DIARIZATION_MODEL = "pyannote/speaker-diarization-3.1"
@@ -46,7 +48,7 @@ def format_timestamp(seconds: float) -> str:
 
 def sanitize_filename(name):
     """Removes invalid characters from a string to make it a valid filename."""
-    name = name.replace('\n', ' ').replace('**', '').strip()
+    name = name.replace("\n", " ").replace("**", "").strip()
     return re.sub(r'[\\/*?:"<>|]', "", name)
 
 
@@ -194,31 +196,34 @@ def format_final_transcript(combined_result):
             continue
 
         current_speaker_name = match.group(1)
-        text_content = line[match.end():]
+        text_content = line[match.end() :]
 
         # Check the last line in our merged list.
         if not merged_lines:
             merged_lines.append(line)
             continue
-            
+
         last_line = merged_lines[-1]
         last_speaker_match = speaker_regex.search(last_line)
 
         # If the last line has a speaker, it's the same as the current one, AND the speaker is not UNKNOWN, then merge.
-        if (last_speaker_match 
-                and last_speaker_match.group(1) == current_speaker_name 
-                and current_speaker_name != "UNKNOWN"):
+        if (
+            last_speaker_match
+            and last_speaker_match.group(1) == current_speaker_name
+            and current_speaker_name != "UNKNOWN"
+        ):
             # Append the text content of the current line to the end of the last line.
             merged_lines[-1] += text_content
         else:
             # Otherwise, this is a new speaker (or UNKNOWN), so add the new line as is.
             merged_lines.append(line)
-            
+
     # Perform final cleanup on the now-merged lines.
     return "\n\n".join(
         line.replace(" :", ":").replace(" ,", ",").replace(" .", ".")
         for line in merged_lines
     )
+
 
 def query_ollama(prompt):
     """Sends a prompt to Ollama and returns the response."""
@@ -240,9 +245,13 @@ def query_ollama(prompt):
         return "Error: Could not retrieve response from Ollama."
 
 
-def get_llm_title(source_text):
+def get_llm_title(source_text: str, attendees: list[str] = None):
     """Generates a descriptive filename title from a text (summary or transcript) using the LLM."""
     logging.info("Generating descriptive title with LLM...")
+
+    possible_names_prompt = """Start the filename with the names {attendees[0]} and {attendees[1]}. Do not mention these names again.
+Example: Bill and Tony discussing expenses"""
+
     prompt = f"""Based on the following text, generate a single, short, descriptive phrase of 4-8 words suitable for a filename.
 - Do NOT use any special characters like quotes or colons.
 - Do NOT explain your thinking.
@@ -250,13 +259,15 @@ def get_llm_title(source_text):
 
 Example: Initial Project Kick-off with the Analytics Team
 
+{possible_names_prompt if len(attendees) == 2 else ""}
+
 Here is the text:
 ---
 {source_text}
 ---
 """
     title = query_ollama(prompt)
-    clean_title = title.split('\n')[0].strip()
+    clean_title = title.split("\n")[0].strip()
     return sanitize_filename(clean_title)
 
 
@@ -291,6 +302,7 @@ Here is the transcript:
 
 # --- Time Marker Highlight Functions ---
 
+
 def parse_tmk_timestamps(filepath: str) -> list[float]:
     """Parses a .tmk file and returns a list of timestamps in seconds."""
     if not os.path.exists(filepath):
@@ -313,7 +325,9 @@ def parse_tmk_timestamps(filepath: str) -> list[float]:
         total_seconds = (minutes * 60) + seconds
         timestamps.append(total_seconds)
 
-    logging.info(f"Found {len(timestamps)} time markers in {os.path.basename(filepath)}.")
+    logging.info(
+        f"Found {len(timestamps)} time markers in {os.path.basename(filepath)}."
+    )
     return timestamps
 
 
@@ -341,7 +355,7 @@ def get_formatted_text_in_window(
             current_turn_speaker = word["speaker"]
             current_turn_text = ""
         current_turn_text += word["text"]
-    
+
     if current_turn_text:
         turns.append(f"{current_turn_speaker}: {current_turn_text.strip()}")
 
@@ -414,7 +428,9 @@ def generate_highlights_section(combined_transcript: list, audio_filepath: str) 
             combined_transcript, highlight_start, highlight_end
         )
         if not highlight_text:
-            logging.warning(f"No highlight text found for marker at {tmk_seconds:.2f}s.")
+            logging.warning(
+                f"No highlight text found for marker at {tmk_seconds:.2f}s."
+            )
             continue
 
         # 4. Get summary for the highlight snippet
@@ -434,6 +450,7 @@ def generate_highlights_section(combined_transcript: list, audio_filepath: str) 
 
 # --- Main Processing Logic ---
 
+
 def process_audio_file(
     filepath, whisper_model, diarization_pipeline, interactive_mode=False
 ):
@@ -443,7 +460,7 @@ def process_audio_file(
     base_filepath = os.path.splitext(filepath)[0]
     logging.info("------------------------------")
     output_filename = f"{base_filepath}.md"
-    
+
     logging.info("Starting audio processing for: %s", os.path.basename(filepath))
 
     # 1. Transcription
@@ -463,7 +480,9 @@ def process_audio_file(
     try:
         audio_loader = Audio(sample_rate=16000, mono=True)
         waveform, sample_rate = audio_loader(filepath)
-        diarization_result = diarization_pipeline({"waveform": waveform, "sample_rate": sample_rate})
+        diarization_result = diarization_pipeline(
+            {"waveform": waveform, "sample_rate": sample_rate}
+        )
     except Exception as e:
         logging.error(f"Error during diarization: {e}", exc_info=True)
         diarization_result = Annotation()
@@ -475,7 +494,7 @@ def process_audio_file(
     combined_transcript = combine_transcription_and_diarization(
         transcription_chunks, diarization_fixed
     )
-    
+
     max_cleanup_loops = 5
     logging.info("Step 3a: Starting iterative cleanup of UNKNOWN segments...")
     for i in range(max_cleanup_loops):
@@ -490,7 +509,7 @@ def process_audio_file(
 
     # 4. Final Formatting
     formatted_transcript = format_final_transcript(combined_transcript)
-    
+
     # 5. Generate Highlights (if .tmk file exists)
     highlights_section = generate_highlights_section(combined_transcript, filepath)
 
@@ -514,17 +533,20 @@ def process_audio_file(
         f.write("---\n\n## Full Transcript\n\n")
         f.write(formatted_transcript)
         f.write("\n")
-    logging.info(f"Successfully created base transcript for {os.path.basename(filepath)}.")
-    
+    logging.info(
+        f"Successfully created base transcript for {os.path.basename(filepath)}."
+    )
+
     return output_filename
 
 
 # --- Interactive Naming Logic ---
 
+
 def parse_md_transcript(content):
     """Parses the markdown transcript to extract speaker turns."""
     turn_pattern = re.compile(r"\[.*?\] \*\*(SPEAKER_\d+|UNKNOWN)\*\*:(.*)")
-    lines = content.split('\n')
+    lines = content.split("\n")
     turns = []
     for line in lines:
         match = turn_pattern.match(line)
@@ -532,36 +554,48 @@ def parse_md_transcript(content):
             turns.append({"speaker": match.group(1), "text": match.group(2).strip()})
     return turns
 
-def generate_speaker_hint_from_turns(speaker_label, turns, start_turn=0, context_turns=1):
+
+def generate_speaker_hint_from_turns(
+    speaker_label, turns, start_turn=0, context_turns=1
+):
     """Generates a conversational hint from a list of turns."""
     occurrence_index = -1
     for i in range(start_turn, len(turns)):
         if turns[i]["speaker"] == speaker_label:
             occurrence_index = i
             break
-            
+
     if occurrence_index == -1:
         return None, -1
-        
+
     start = max(0, occurrence_index - context_turns)
     end = min(len(turns), occurrence_index + context_turns + 1)
-    
+
     hint_lines = []
     for i in range(start, end):
         turn = turns[i]
-        speaker = turn['speaker']
-        text = turn['text']
-        display_speaker = f"**{speaker}**" if speaker == speaker_label else speaker
+        speaker = turn["speaker"]
+        text = turn["text"]
+        display_speaker = (
+            (Fore.CYAN + f"**{speaker}**")
+            if speaker == speaker_label
+            else (Fore.WHITE + speaker)
+        )
         hint_lines.append(f"    {display_speaker}: {text}")
-        
+
     return "\n".join(hint_lines), occurrence_index
+
 
 def interactive_renaming(md_filepath):
     """Handles the interactive speaker renaming process, including re-running summaries."""
-    logging.info(f"Starting interactive renaming for {os.path.basename(md_filepath)}...")
-    
+    logging.info(
+        Fore.YELLOW
+        + f"Starting interactive renaming for {os.path.basename(md_filepath)}..."
+        + Fore.WHITE
+    )
+
     try:
-        with open(md_filepath, 'r', encoding='utf-8') as f:
+        with open(md_filepath, "r", encoding="utf-8") as f:
             content = f.read()
     except FileNotFoundError:
         logging.error(f"Could not find file for interactive session: {md_filepath}")
@@ -569,12 +603,14 @@ def interactive_renaming(md_filepath):
 
     transcript_section_for_hints = content.split("## Full Transcript\n\n")[-1]
     turns = parse_md_transcript(transcript_section_for_hints)
-    
-    speaker_labels = sorted(list(set(turn["speaker"] for turn in turns if "SPEAKER" in turn["speaker"])))
-    
+
+    speaker_labels = sorted(
+        list(set(turn["speaker"] for turn in turns if "SPEAKER" in turn["speaker"]))
+    )
+
     name_map = {}
     if not speaker_labels:
-        logging.info("No generic speaker labels found to rename in this file.")
+        logging.info("No generic 'SPEAKER_XX' labels found to rename in this file.")
         return
 
     print("\n--- Assign Speaker Names ---")
@@ -582,31 +618,41 @@ def interactive_renaming(md_filepath):
     for label in speaker_labels:
         search_from_turn = 0
         while True:
-            hint, found_at = generate_speaker_hint_from_turns(label, turns, start_turn=search_from_turn)
+            hint, found_at = generate_speaker_hint_from_turns(
+                label, turns, start_turn=search_from_turn
+            )
+
             if not hint:
-                print(f"\nNo more occurrences of {label} found.")
-                break
+                # If we've run out of new hints, reset to the beginning and continue the loop.
+                print(
+                    f"\nNo more new snippets for {label}. Restarting from the beginning."
+                )
+                search_from_turn = 0
+                continue
 
             print(f"\n--- Who is {label}? (Press Enter for next hint) ---")
             print("  Context:")
             print(hint)
-            
-            new_name = input(f"Enter name for {label} (or 'SKIP' for all, '?' for this one): ")
 
-            if new_name.lower() == 'skip':
+            new_name = input(
+                f"Enter name for {Fore.CYAN + label + Fore.WHITE} (or 'SKIP' for all, '?' for this one): "
+            )
+
+            if new_name.lower() == "skip":
                 skip_all = True
                 break
-            elif new_name == '?':
+            elif new_name == "?":
                 logging.info(f"Skipping speaker {label} for now.")
-                break 
+                break
             elif new_name:
                 name_map[label] = new_name.strip()
                 break
             else:
+                # User pressed enter, get next hint
                 search_from_turn = found_at + 1
         if skip_all:
             break
-            
+
     if not name_map:
         logging.info("No names were assigned. File remains unchanged.")
         return
@@ -618,10 +664,16 @@ def interactive_renaming(md_filepath):
         updated_content = updated_content.replace(f"**{old_label}**", f"**{new_name}**")
 
         # 2. Create a flexible regex to catch variations like 'Speaker_01', 'speaker 01', etc.
-        label_parts = old_label.split('_')
+        label_parts = old_label.split("_")
         if len(label_parts) == 2:
             # Constructs a pattern like r'\bSPEAKER[_ ]01\b' and compiles it case-insensitively
-            pattern_str = r'\b' + re.escape(label_parts[0]) + r'[_ ]' + re.escape(label_parts[1]) + r'\b'
+            pattern_str = (
+                r"\b"
+                + re.escape(label_parts[0])
+                + r"[_ ]"
+                + re.escape(label_parts[1])
+                + r"\b"
+            )
             try:
                 pattern = re.compile(pattern_str, re.IGNORECASE)
                 updated_content = pattern.sub(new_name, updated_content)
@@ -629,13 +681,14 @@ def interactive_renaming(md_filepath):
                 logging.warning(f"Could not compile regex for '{old_label}': {e}")
         else:
             # Fallback for any unexpected label formats
-            pattern = re.compile(r'\b' + re.escape(old_label) + r'\b', re.IGNORECASE)
+            pattern = re.compile(r"\b" + re.escape(old_label) + r"\b", re.IGNORECASE)
             updated_content = pattern.sub(new_name, updated_content)
 
     # --- SECTION: Generate new content ---
     named_transcript_text = updated_content.split("## Full Transcript\n\n")[-1]
     new_summary_section = get_llm_summary_and_actions(named_transcript_text)
     unique_attendees = sorted(list(set(name_map.values())))
+    unique_named_attendees = sorted(list(set(name_map.values()) - {"UNKNOWN"}))
     attendees_list = "\n".join(f"* {name}" for name in unique_attendees)
     attendees_section = f"## Attendees\n\n{attendees_list}"
 
@@ -643,9 +696,11 @@ def interactive_renaming(md_filepath):
     title_match = re.search(r"(# Meeting Notes: .*?)\n\n", updated_content, re.DOTALL)
     title_section = title_match.group(1) if title_match else ""
 
-    highlights_match = re.search(r"(## Highlights\n\n.*?)(\n\n---|\n\n##)", updated_content, re.DOTALL)
+    highlights_match = re.search(
+        r"(## Highlights\n\n.*?)(\n\n---|\n\n##)", updated_content, re.DOTALL
+    )
     highlights_section = highlights_match.group(1).strip() if highlights_match else ""
-    
+
     transcript_section = f"## Full Transcript\n\n{named_transcript_text}"
 
     # --- SECTION: Assemble the final markdown from parts ---
@@ -660,7 +715,7 @@ def interactive_renaming(md_filepath):
     if highlights_section:
         final_content_parts.append(highlights_section)
         final_content_parts.append("\n\n")
-    
+
     final_content_parts.append("---\n\n")
     final_content_parts.append(transcript_section)
 
@@ -668,8 +723,8 @@ def interactive_renaming(md_filepath):
 
     # --- SECTION: Generate new filename and save ---
     title_source = new_summary_section if new_summary_section else named_transcript_text
-    new_title = get_llm_title(title_source)
-    
+    new_title = get_llm_title(title_source, unique_named_attendees)
+
     audio_filename_match = re.search(r"# Meeting Notes: (.*?)\n", content)
     if audio_filename_match:
         original_audio_name = os.path.splitext(audio_filename_match.group(1))[0]
@@ -680,9 +735,9 @@ def interactive_renaming(md_filepath):
 
     new_filepath = f"{base_filepath} {new_title}.md"
 
-    with open(new_filepath, 'w', encoding='utf-8') as f:
+    with open(new_filepath, "w", encoding="utf-8") as f:
         f.write(final_content)
-    
+
     if new_filepath != md_filepath:
         logging.info(f"Renaming output file to: {os.path.basename(new_filepath)}")
         try:
@@ -690,7 +745,10 @@ def interactive_renaming(md_filepath):
         except OSError as e:
             logging.error(f"Error removing old file {md_filepath}: {e}")
 
-    logging.info(f"Successfully updated speaker names and summaries in {os.path.basename(new_filepath)}.")
+    logging.info(
+        f"Successfully updated speaker names and summaries in {os.path.basename(new_filepath)}."
+    )
+
 
 def main():
     """Main entry point for the script."""
@@ -722,7 +780,7 @@ def main():
     elif torch.backends.mps.is_available():
         pyannote_device = torch.device("mps")
         # Forcing Whisper to CPU to avoid MPS backend error
-        whisper_device = "cpu" 
+        whisper_device = "cpu"
     else:
         pyannote_device = torch.device("cpu")
         whisper_device = "cpu"
@@ -736,8 +794,10 @@ def main():
         diarization_pipeline = Pipeline.from_pretrained(
             DIARIZATION_MODEL, use_auth_token=hf_api_key
         )
-        if hasattr(diarization_pipeline, 'segmentation') and hasattr(diarization_pipeline.segmentation, 'hyperparameters'):
-             diarization_pipeline.segmentation.hyperparameters = hyperparameters
+        if hasattr(diarization_pipeline, "segmentation") and hasattr(
+            diarization_pipeline.segmentation, "hyperparameters"
+        ):
+            diarization_pipeline.segmentation.hyperparameters = hyperparameters
         diarization_pipeline.to(pyannote_device)
     except Exception as e:
         logging.error(f"Failed to load models: {e}", exc_info=True)
@@ -750,12 +810,17 @@ def main():
         if os.path.splitext(args.path)[1].lower() in SUPPORTED_EXTENSIONS:
             files_to_process.append(args.path)
         else:
-            logging.error(f"Unsupported file type: {args.path}. Supported are: {SUPPORTED_EXTENSIONS}")
+            logging.error(
+                f"Unsupported file type: {args.path}. Supported are: {SUPPORTED_EXTENSIONS}"
+            )
             sys.exit(1)
     elif os.path.isdir(args.path):
         for filename in sorted(os.listdir(args.path)):
             file_path = os.path.join(args.path, filename)
-            if (os.path.isfile(file_path) and os.path.splitext(filename)[1].lower() in SUPPORTED_EXTENSIONS):
+            if (
+                os.path.isfile(file_path)
+                and os.path.splitext(filename)[1].lower() in SUPPORTED_EXTENSIONS
+            ):
                 files_to_process.append(file_path)
 
     is_single_file_run = os.path.isfile(args.path)
@@ -765,35 +830,42 @@ def main():
         try:
             directory, base_name_with_ext = os.path.split(file_path)
             base_name = os.path.splitext(base_name_with_ext)[0]
-            directory = directory or '.'
-            
+            directory = directory or "."
+
             existing_md_file = None
             for f in os.listdir(directory):
                 # Match files that start with the base audio name but might have titles added.
-                if f.startswith(base_name) and f.endswith('.md'):
+                if f.startswith(base_name) and f.endswith(".md"):
                     existing_md_file = os.path.join(directory, f)
                     break
-            
+
             if existing_md_file:
-                with open(existing_md_file, 'r', encoding='utf-8') as f:
+                with open(existing_md_file, "r", encoding="utf-8") as f:
                     content = f.read()
                 is_already_named = "## Attendees" in content
 
                 if args.interactive and (not is_already_named or is_single_file_run):
                     interactive_renaming(existing_md_file)
                 elif not args.interactive:
-                    logging.info("Skipping already processed file (run with --interactive to rename).")
+                    logging.info(
+                        "Skipping already processed file (run with --interactive to rename)."
+                    )
 
             else:
                 output_md_path_from_process = process_audio_file(
-                    file_path, whisper_model, diarization_pipeline, interactive_mode=args.interactive
+                    file_path,
+                    whisper_model,
+                    diarization_pipeline,
+                    interactive_mode=args.interactive,
                 )
-                
+
                 if args.interactive and output_md_path_from_process:
                     interactive_renaming(output_md_path_from_process)
 
         except Exception as e:
-            logging.error(f"Failed to process {os.path.basename(file_path)}: {e}", exc_info=True)
+            logging.error(
+                f"Failed to process {os.path.basename(file_path)}: {e}", exc_info=True
+            )
 
 
 if __name__ == "__main__":
