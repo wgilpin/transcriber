@@ -278,7 +278,7 @@ def get_llm_summary_and_actions(transcript_text):
     logging.info("Generating summary and action items with LLM...")
     prompt = f"""Please provide a summary and action points (if any) for the following meeting transcript.
 Focus on the key decisions and outcomes.
-The summary should be short and cover the main points.
+The summary should be short and cover the main points. Do not discuss the tone or length of the meeting.
 For the action items, extract all explicit action items and identify the assigned person if mentioned. Format as a markdown list. If no action items are found, state that clearly.
 Your entire response MUST be in markdown format, starting with a '## Summary' section followed by an '## Action Items' section. For example:
 
