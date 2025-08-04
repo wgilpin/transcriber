@@ -249,7 +249,9 @@ def get_llm_title(source_text: str, attendees: list[str] = None):
     """Generates a descriptive filename title from a text (summary or transcript) using the LLM."""
     logging.info("Generating descriptive title with LLM...")
 
-    possible_names_prompt = """Start the filename with the names {attendees[0]} and {attendees[1]}. Do not mention these names again.
+    possible_names_prompt = ""
+    if attendees and len(attendees) >= 2:
+        possible_names_prompt = f"""Start the filename with the names {attendees[0]} and {attendees[1]}. Do not mention these names again.
 Example: Bill and Tony discussing expenses"""
 
     prompt = f"""Based on the following text, generate a single, short, descriptive phrase of 4-8 words suitable for a filename.
@@ -259,7 +261,7 @@ Example: Bill and Tony discussing expenses"""
 
 Example: Initial Project Kick-off with the Analytics Team
 
-{possible_names_prompt if len(attendees) == 2 else ""}
+{possible_names_prompt}
 
 Here is the text:
 ---
@@ -586,153 +588,173 @@ def generate_speaker_hint_from_turns(
     return "\n".join(hint_lines), occurrence_index
 
 
-def interactive_renaming(md_filepath):
-    """Handles the interactive speaker renaming process, including re-running summaries."""
-    logging.info(
-        Fore.YELLOW
-        + f"Starting interactive renaming for {os.path.basename(md_filepath)}..."
-        + Fore.WHITE
-    )
+def _get_speaker_name(label: str, turns: list, assigned_names: set) -> str | None:
+    """
+    Interactively prompts the user to assign a name to a single speaker label.
 
-    try:
-        with open(md_filepath, "r", encoding="utf-8") as f:
-            content = f.read()
-    except FileNotFoundError:
-        logging.error(f"Could not find file for interactive session: {md_filepath}")
-        return
+    Returns:
+        - A string with the chosen name.
+        - None, if the user wants to skip just this speaker ('?').
+        - The sentinel string "SKIP_ALL", if the user wants to skip all renaming for this file.
+    """
+    search_from_turn = 0
+    while True:
+        hint, found_at = generate_speaker_hint_from_turns(
+            label, turns, start_turn=search_from_turn
+        )
+        if not hint:
+            print(f"\nNo more new snippets for {label}. Restarting from the beginning.")
+            search_from_turn = 0
+            continue
 
-    transcript_section_for_hints = content.split("## Full Transcript\n\n")[-1]
-    turns = parse_md_transcript(transcript_section_for_hints)
+        # --- Display context and prompt ---
+        print(f"\n--- Who is {label}? (Press Enter for next hint) ---")
+        print("  Context:")
+        print(hint)
 
-    speaker_labels = sorted(
-        list(set(turn["speaker"] for turn in turns if "SPEAKER" in turn["speaker"]))
-    )
+        # Build a clear prompt for the user
+        prompt_message = f"Enter name for {Fore.CYAN + label + Fore.WHITE}"
+        sorted_names = sorted(list(assigned_names))
+        if assigned_names:
+            print("\n  Or choose from existing:")
+            for i, name in enumerate(sorted_names):
+                print(f"    {i+1}. {name}")
+            prompt_message += ", choose a number,"
+        
+        prompt_message += f", use '?' to skip speaker, or 'skip' to skip all: "
+        user_input = input(prompt_message).strip()
+        user_input_lower = user_input.lower()
 
-    name_map = {}
-    if not speaker_labels:
-        logging.info("No generic 'SPEAKER_XX' labels found to rename in this file.")
-        return
+        # --- Process user input ---
+        if user_input_lower == "skip":
+            logging.info("User chose to skip all remaining speaker naming for this file.")
+            return "SKIP_ALL"
+        
+        if user_input_lower == "?":
+            logging.info(f"Skipping speaker {label} for now.")
+            return None
 
-    print("\n--- Assign Speaker Names ---")
-    skip_all = False
-    for label in speaker_labels:
-        search_from_turn = 0
-        while True:
-            hint, found_at = generate_speaker_hint_from_turns(
-                label, turns, start_turn=search_from_turn
-            )
+        if not user_input:
+            search_from_turn = found_at + 1
+            continue
 
-            if not hint:
-                # If we've run out of new hints, reset to the beginning and continue the loop.
-                print(
-                    f"\nNo more new snippets for {label}. Restarting from the beginning."
-                )
-                search_from_turn = 0
-                continue
-
-            print(f"\n--- Who is {label}? (Press Enter for next hint) ---")
-            print("  Context:")
-            print(hint)
-
-            new_name = input(
-                f"Enter name for {Fore.CYAN + label + Fore.WHITE} (or 'SKIP' for all, '?' for this one): "
-            )
-
-            if new_name.lower() == "skip":
-                skip_all = True
-                break
-            elif new_name == "?":
-                logging.info(f"Skipping speaker {label} for now.")
-                break
-            elif new_name:
-                name_map[label] = new_name.strip()
-                break
+        try:
+            choice_index = int(user_input) - 1
+            if assigned_names and 0 <= choice_index < len(sorted_names):
+                return sorted_names[choice_index]
             else:
-                # User pressed enter, get next hint
-                search_from_turn = found_at + 1
-        if skip_all:
-            break
+                print(Fore.RED + "Invalid number. Please try again." + Fore.WHITE)
+                continue
+        except ValueError:
+            return user_input # Not a number, so treat as a new name.
 
-    if not name_map:
-        logging.info("No names were assigned. File remains unchanged.")
-        return
+def _gather_all_speaker_names(turns: list, speaker_labels: list) -> dict | None:
+    """
+    Iterates through all speaker labels to build a map of labels to real names.
+    Returns the name_map, or None if the user chose to skip all renaming for the file.
+    """
+    name_map = {}
+    assigned_names = set()
+    print("\n--- Assign Speaker Names ---")
 
-    logging.info(f"Applying new names: {name_map}")
+    for label in speaker_labels:
+        # Check if this label has already been assigned a name due to an earlier merge
+        if label in name_map:
+            continue
+
+        result = _get_speaker_name(label, turns, assigned_names)
+
+        if result == "SKIP_ALL":
+            return None  # Propagate the "skip all" command
+
+        if result:  # A name was provided (result is not None)
+            name_map[label] = result
+            assigned_names.add(result)
+            
+    return name_map
+
+def _apply_names_to_transcript(content: str, name_map: dict) -> str:
+    """
+    Replaces all speaker labels in the transcript with their assigned names.
+    """
     updated_content = content
+    # Replace speaker labels like **SPEAKER_01** with their assigned names
     for old_label, new_name in name_map.items():
-        # 1. Replace the specific markdown format in the main transcript.
         updated_content = updated_content.replace(f"**{old_label}**", f"**{new_name}**")
+    
+    # After initial replacement, handle potential in-text occurrences if they exist (though unlikely with current diarization output)
+    # This part might be redundant if speaker labels only appear as **SPEAKER_XX**, but kept for robustness.
+    # The original regex for parts was potentially problematic, simplifying.
+    for old_label, new_name in name_map.items():
+        # This regex targets SPEAKER_XX or similar in plain text if it somehow appears
+        # It's more aggressive and might need refinement if speaker names genuinely contain "SPEAKER_"
+        # For now, stick to just replacing the bolded ones which is where they primarily appear.
+        pass # Removed the problematic regex replacement
 
-        # 2. Create a flexible regex to catch variations like 'Speaker_01', 'speaker 01', etc.
-        label_parts = old_label.split("_")
-        if len(label_parts) == 2:
-            # Constructs a pattern like r'\bSPEAKER[_ ]01\b' and compiles it case-insensitively
-            pattern_str = (
-                r"\b"
-                + re.escape(label_parts[0])
-                + r"[_ ]"
-                + re.escape(label_parts[1])
-                + r"\b"
-            )
-            try:
-                pattern = re.compile(pattern_str, re.IGNORECASE)
-                updated_content = pattern.sub(new_name, updated_content)
-            except re.error as e:
-                logging.warning(f"Could not compile regex for '{old_label}': {e}")
-        else:
-            # Fallback for any unexpected label formats
-            pattern = re.compile(r"\b" + re.escape(old_label) + r"\b", re.IGNORECASE)
-            updated_content = pattern.sub(new_name, updated_content)
+    return updated_content
 
-    # --- SECTION: Generate new content ---
-    named_transcript_text = updated_content.split("## Full Transcript\n\n")[-1]
+def _regenerate_llm_content(named_transcript_text: str, name_map: dict) -> tuple[str, str, str]:
+    """
+    Generates new summary, attendees list, and title using the named transcript.
+    """
     new_summary_section = get_llm_summary_and_actions(named_transcript_text)
-    unique_attendees = sorted(list(set(name_map.values())))
-    unique_named_attendees = sorted(list(set(name_map.values()) - {"UNKNOWN"}))
-    attendees_list = "\n".join(f"* {name}" for name in unique_attendees)
-    attendees_section = f"## Attendees\n\n{attendees_list}"
+    
+    # Ensure attendees list is based on all values in name_map, plus any UNKNOWNs if they were not renamed
+    all_speakers_in_transcript = set(re.findall(r"\*\*([A-Za-z0-9_]+)\*\*", named_transcript_text))
+    unique_attendees = sorted(list(all_speakers_in_transcript - {"UNKNOWN"}))
+    
+    attendees_list_str = "\n".join(f"* {name}" for name in unique_attendees)
+    attendees_section = f"## Attendees\n\n{attendees_list_str}"
+    
+    # Pass only explicitly named attendees (not UNKNOWN) to the title function
+    unique_named_attendees_for_title = sorted(list(set(name_map.values()) - {"UNKNOWN"}))
+    title_source = new_summary_section if new_summary_section else named_transcript_text
+    new_title = get_llm_title(title_source, unique_named_attendees_for_title)
+    
+    return new_summary_section, attendees_section, new_title
 
-    # --- SECTION: Extract and Preserve existing content ---
-    title_match = re.search(r"(# Meeting Notes: .*?)\n\n", updated_content, re.DOTALL)
-    title_section = title_match.group(1) if title_match else ""
+def _assemble_final_markdown(original_content: str, named_transcript_text: str, attendees_section: str, summary_section: str, new_title: str) -> str:
+    """
+    Assembles the final markdown file from its constituent parts.
+    """
+    # Extract original sections
+    title_match = re.search(r"(# Meeting Notes: .*?)\n\n", original_content, re.DOTALL)
+    original_audio_filename = "Audio File"
+    if title_match:
+        original_title_line = title_match.group(1)
+        audio_filename_match = re.search(r"# Meeting Notes: (.*?)$", original_title_line)
+        if audio_filename_match:
+            original_audio_filename = audio_filename_match.group(1)
 
-    highlights_match = re.search(
-        r"(## Highlights\n\n.*?)(\n\n---|\n\n##)", updated_content, re.DOTALL
-    )
+    highlights_match = re.search(r"(## Highlights\n\n.*?)(\n\n---|\n\n##)", original_content, re.DOTALL)
     highlights_section = highlights_match.group(1).strip() if highlights_match else ""
 
-    transcript_section = f"## Full Transcript\n\n{named_transcript_text}"
+    # New title line (important for the filename update)
+    final_title_line = f"# Meeting Notes: {original_audio_filename}"
 
-    # --- SECTION: Assemble the final markdown from parts ---
-    final_content_parts = [
-        title_section,
-        "\n\n",
-        attendees_section,
-        "\n\n",
-        new_summary_section,
-        "\n\n",
-    ]
+    final_content_parts = [final_title_line, "\n\n", attendees_section, "\n\n", summary_section, "\n\n"]
     if highlights_section:
-        final_content_parts.append(highlights_section)
-        final_content_parts.append("\n\n")
+        final_content_parts.extend([highlights_section, "\n\n"])
+    final_content_parts.extend(["---\n\n", f"## Full Transcript\n\n{named_transcript_text}"])
 
-    final_content_parts.append("---\n\n")
-    final_content_parts.append(transcript_section)
+    return "".join(final_content_parts)
 
-    final_content = "".join(final_content_parts)
 
-    # --- SECTION: Generate new filename and save ---
-    title_source = new_summary_section if new_summary_section else named_transcript_text
-    new_title = get_llm_title(title_source, unique_named_attendees)
-
-    audio_filename_match = re.search(r"# Meeting Notes: (.*?)\n", content)
+def _save_and_cleanup(final_content: str, new_title: str, md_filepath: str, original_content: str):
+    """
+    Saves the new markdown file and removes the old one.
+    """
+    audio_filename_match = re.search(r"# Meeting Notes: (.*?)\n", original_content)
     if audio_filename_match:
-        original_audio_name = os.path.splitext(audio_filename_match.group(1))[0]
+        original_audio_name_with_ext = audio_filename_match.group(1).strip()
+        original_audio_name_base = os.path.splitext(original_audio_name_with_ext)[0]
         original_dir = os.path.dirname(md_filepath)
-        base_filepath = os.path.join(original_dir, original_audio_name)
+        base_filepath = os.path.join(original_dir, original_audio_name_base)
     else:
+        # Fallback if title line parsing fails
         base_filepath = os.path.splitext(os.path.splitext(md_filepath)[0])[0]
 
+    # Construct the new filename, ensuring it's in the same directory as the original audio
     new_filepath = f"{base_filepath} {new_title}.md"
 
     with open(new_filepath, "w", encoding="utf-8") as f:
@@ -745,11 +767,61 @@ def interactive_renaming(md_filepath):
         except OSError as e:
             logging.error(f"Error removing old file {md_filepath}: {e}")
 
-    logging.info(
-        f"Successfully updated speaker names and summaries in {os.path.basename(new_filepath)}."
-    )
+    logging.info(f"Successfully updated speaker names and summaries in {os.path.basename(new_filepath)}.")
 
+def interactive_renaming(md_filepath: str):
+    """
+    Main orchestrator for the interactive speaker renaming process.
+    """
+    logging.info(Fore.YELLOW + f"Interactive renaming for {os.path.basename(md_filepath)}..." + Fore.WHITE)
 
+    # 1. Read and Parse File
+    try:
+        with open(md_filepath, "r", encoding="utf-8") as f:
+            original_content = f.read()
+    except FileNotFoundError:
+        logging.error(f"Could not find file for interactive session: {md_filepath}")
+        return
+
+    transcript_section = original_content.split("## Full Transcript\n\n")[-1]
+    turns = parse_md_transcript(transcript_section)
+    
+    # --- CHANGE IN LOGIC IS HERE ---
+    # OLD BEHAVIOR: Sorts speakers alphabetically, e.g., [SPEAKER_00, SPEAKER_01]
+    # speaker_labels = sorted(list(set(turn["speaker"] for turn in turns if "SPEAKER" in turn["speaker"])))
+
+    # NEW BEHAVIOR: Gets speakers in order of their first appearance in the transcript.
+    all_speakers_in_order = (turn["speaker"] for turn in turns if "SPEAKER" in turn["speaker"])
+    speaker_labels = list(dict.fromkeys(all_speakers_in_order))
+    # --- END OF CHANGE ---
+
+    name_map = None 
+    if speaker_labels:
+        # 2. Interactively Get Speaker Names
+        name_map = _gather_all_speaker_names(turns, speaker_labels)
+    else:
+        logging.info("No generic 'SPEAKER_XX' labels found to rename in this file.")
+        # If no generic labels, we still want to regenerate summary, so we proceed with an empty map
+        name_map = {}
+        
+    # If user selected SKIP_ALL, name_map will be None.
+    # In this case, we proceed with an empty map, effectively renaming nothing,
+    # but still regenerating the summary/title based on the original SPEAKER_XX labels.
+    if name_map is None:
+        logging.info("Skipping interactive naming. Regenerating summary with existing speaker labels.")
+        name_map = {} # Treat as if no names were entered.
+
+    # 3. Apply Names and Regenerate Content
+    logging.info(f"Applying new names: {name_map if name_map else 'No new names to apply.'}")
+    
+    named_content_full = _apply_names_to_transcript(original_content, name_map)
+    named_transcript_text = named_content_full.split("## Full Transcript\n\n")[-1]
+    
+    summary_section, attendees_section, new_title = _regenerate_llm_content(named_transcript_text, name_map)
+
+    # 4. Assemble and Save Final Markdown
+    final_content = _assemble_final_markdown(original_content, named_transcript_text, attendees_section, summary_section, new_title)
+    _save_and_cleanup(final_content, new_title, md_filepath, original_content)
 def main():
     """Main entry point for the script."""
     parser = argparse.ArgumentParser(
@@ -844,12 +916,10 @@ def main():
                     content = f.read()
                 is_already_named = "## Attendees" in content
 
+                # Always run interactive_renaming if --interactive is passed on a single file
+                # This allows re-running naming even on already named files if desired.
                 if args.interactive and (not is_already_named or is_single_file_run):
                     interactive_renaming(existing_md_file)
-                elif not args.interactive:
-                    logging.info(
-                        "Skipping already processed file (run with --interactive to rename)."
-                    )
 
             else:
                 output_md_path_from_process = process_audio_file(
