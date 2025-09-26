@@ -42,11 +42,11 @@ It's designed for anyone who needs to process meeting audio efficiently, turning
 You can install the required packages using pip. It's recommended to do this in a virtual environment.
 
 ```bash
-pip install torch torchaudio --index-url [https://download.pytorch.org/whl/cu118](https://download.pytorch.org/whl/cu118)
-pip install openai-whisper
-pip install pyannote.audio
-pip install ollama
-pip install python-dotenv
+uv pip install torch torchvision torchaudio
+uv pip install openai-whisper
+uv pip install pyannote.audio
+uv pip install ollama
+uv pip install python-dotenv
 ```
 
 _Note: The `pyannote.audio` library may require you to accept user conditions on the Hugging Face Hub for the models it uses._
