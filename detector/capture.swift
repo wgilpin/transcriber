@@ -95,6 +95,11 @@ if args.contains("--list-mics") {
 }
 
 let wantMic = argValue("--mic")
+// Opt-in only: macOS voice processing (VPIO) seizes the output device as its
+// AEC reference and ducks it hard - on speakers it silences the meeting you
+// are trying to hear, and it reported a bogus 8-channel input format here.
+// Echo bleed is handled downstream instead, against the far track.
+let useAEC = args.contains("--aec")
 let wantBundle = argValue("--bundle") ?? "Chrome"
 let seconds = Double(argValue("--seconds") ?? "") ?? 0     // 0 = until SIGINT
 let title = argValue("--title")
@@ -107,11 +112,17 @@ let stamp: String = {
     let f = DateFormatter(); f.dateFormat = "yyyy-MM-dd-HHmmss"
     return f.string(from: Date())
 }()
-let sessionDir = URL(fileURLWithPath: baseDir).appendingPathComponent(stamp)
+// Warm-up exists only to trigger TCC prompts; it must not litter Recordings.
+let sessionDir: URL = args.contains("--warmup")
+    ? URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("meetingd-warmup")
+    : (argValue("--session").map { URL(fileURLWithPath: $0) }
+       ?? URL(fileURLWithPath: baseDir).appendingPathComponent(stamp))
 try? FileManager.default.createDirectory(at: sessionDir, withIntermediateDirectories: true)
 let farURL = sessionDir.appendingPathComponent("far.wav")
 let micURL = sessionDir.appendingPathComponent("mic.wav")
 print("session: \(sessionDir.path)")
+let pidFile = sessionDir.appendingPathComponent("capture.pid")
+try? String(ProcessInfo.processInfo.processIdentifier).write(to: pidFile, atomically: true, encoding: .utf8)
 
 let engine = AVAudioEngine()
 var micFile: AVAudioFile?
@@ -131,13 +142,22 @@ for o in processObjects() {
 }
 let playing = matches.filter { $0.output }
 let chosen = playing.isEmpty ? matches : playing
-guard !chosen.isEmpty else {
+let warmup = args.contains("--warmup")
+if chosen.isEmpty && !warmup {
     print("no audio process matching '\(wantBundle)' — nothing to tap")
     exit(1)
 }
-print("far track: tapping \(chosen.count) \(wantBundle) process(es)")
 
-let tapDesc = CATapDescription(stereoMixdownOfProcesses: chosen.map { $0.obj })
+// A global tap still triggers the audio-capture prompt when nothing happens to
+// be playing, which is what warm-up needs.
+let tapDesc: CATapDescription
+if chosen.isEmpty {
+    print("far track: nothing playing — global tap for warm-up only")
+    tapDesc = CATapDescription(stereoGlobalTapButExcludeProcesses: [])
+} else {
+    print("far track: tapping \(chosen.count) \(wantBundle) process(es)")
+    tapDesc = CATapDescription(stereoMixdownOfProcesses: chosen.map { $0.obj })
+}
 tapDesc.name = "meetingd-farend"
 tapDesc.isPrivate = true
 tapDesc.muteBehavior = .unmuted
@@ -220,14 +240,16 @@ guard AudioDeviceCreateIOProcIDWithBlock(&procID, aggID, nil, { _, inData, _, _,
     print("IOProc failed"); exit(6)
 }
 
-micStarted = Date()
-// ── microphone permission + engine ──────────────────────────────────────
-let micSem = DispatchSemaphore(value: 0)
-AVCaptureDevice.requestAccess(for: .audio) { ok in micAllowed = ok; micSem.signal() }
-_ = micSem.wait(timeout: .now() + 60)
-print("microphone: \(micAllowed ? "granted" : "DENIED")")
+farStarted = Date()
+AudioDeviceStart(aggID, procID)
 
-if micAllowed {
+// The far end is already recording by now. Asking for microphone permission can
+// block on a dialog for as long as the user takes to notice it, so it must not
+// sit in front of the tap - that cost us the opening of a real meeting.
+// ── microphone permission + engine ──────────────────────────────────────
+
+func setUpMic() {
+    micStarted = Date()
     let input = engine.inputNode
     // The system default input is often the built-in mic, which returns digital
     // silence when the lid is shut. Pick the device explicitly.
@@ -245,6 +267,21 @@ if micAllowed {
             print("no input device matching '\(want)'. Try --list-mics")
         }
     }
+    // Speakers mean the far end bleeds into the mic. macOS's own voice
+    // processing cancels it, using system output as the reference signal.
+    // It forces mono and adds AGC + noise suppression, so --no-aec exists
+    // to record raw for comparison.
+    if useAEC {
+        do {
+            try input.setVoiceProcessingEnabled(true)
+            print("echo cancellation: on — WARNING: this ducks your speaker output")
+        } catch {
+            print("echo cancellation unavailable: \(error.localizedDescription)")
+        }
+    } else {
+        print("echo cancellation: off (bleed handled downstream)")
+    }
+
     // inputFormat is the hardware format. outputFormat returns AVAudioEngine's
     // 44100/1ch default when the input chain was never realised - which yields
     // a tap that fires at the right rate but delivers pure silence.
@@ -294,8 +331,25 @@ if micAllowed {
 }
 
 
-farStarted = Date()
-AudioDeviceStart(aggID, procID)
+
+AVCaptureDevice.requestAccess(for: .audio) { ok in
+    micAllowed = ok
+    print("microphone: \(ok ? "granted" : "DENIED")")
+    if ok { setUpMic() } else { print("recording far end only") }
+}
+
+if warmup {
+    // Clear both prompts ahead of time so a real meeting never waits on a dialog.
+    Thread.sleep(forTimeInterval: 3)
+    print("warmup done")
+    try? FileManager.default.removeItem(at: sessionDir)
+    AudioDeviceStop(aggID, procID)
+    AudioDeviceDestroyIOProcID(aggID, procID)
+    AudioHardwareDestroyAggregateDevice(aggID)
+    AudioHardwareDestroyProcessTap(tapID)
+    exit(0)
+}
+
 
 // ── run ─────────────────────────────────────────────────────────────────
 nonisolated(unsafe) var stopFlag: sig_atomic_t = 0
@@ -345,6 +399,7 @@ writeQ.sync {}
 farFile = nil
 micFile = nil
 
+try? FileManager.default.removeItem(at: pidFile)
 let ended = Date()
 let iso = ISO8601DateFormatter()
 var sidecar: [String: Any] = [
@@ -355,6 +410,7 @@ var sidecar: [String: Any] = [
     "far_frames": counters.farFrames,
     "mic_track": micAllowed ? "mic.wav" : NSNull(),
     "tapped_bundle": wantBundle,
+    "aec": useAEC,
     "mic_frames": counters.micFrames,
     "mic_started": micStarted.map { iso.string(from: $0) } ?? NSNull(),
     "far_started": farStarted.map { iso.string(from: $0) } ?? NSNull(),

@@ -135,26 +135,59 @@ func liveMeetTabs() -> [LiveCall] {
         repeat with t in tabs of w
           set u to URL of t
           if u contains "meet.google.com/" then
-            set out to out & u & "\t" & (title of t) & "\n"
+            set out to out & u & "<|>" & (title of t) & linefeed
           end if
         end repeat
       end repeat
       return out
     end tell
     """
-    guard let script = NSAppleScript(source: src) else { return [] }
-    var err: NSDictionary?
-    let res = script.executeAndReturnError(&err)
-    if err != nil { tabReadFailed = true; return [] }
+    // osascript as a subprocess, not NSAppleScript: NSAppleScript is not thread
+    // safe and fails silently off the main thread, which quietly demoted every
+    // meeting to a calendar-only guess.
+    let p = Process()
+    p.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
+    p.arguments = ["-e", src]
+    let pipe = Pipe()
+    p.standardOutput = pipe
+    p.standardError = FileHandle.nullDevice
+    do { try p.run() } catch { tabReadFailed = true; return [] }
+    let data = pipe.fileHandleForReading.readDataToEndOfFile()
+    p.waitUntilExit()
+    guard p.terminationStatus == 0, let text = String(data: data, encoding: .utf8) else {
+        tabReadFailed = true
+        return []
+    }
     tabReadFailed = false
-    guard let text = res.stringValue else { return [] }
     var out: [LiveCall] = []
     for line in text.split(separator: "\n") {
-        let parts = line.split(separator: "\t", maxSplits: 1, omittingEmptySubsequences: false)
+        let parts = line.components(separatedBy: "<|>")
         guard let u = parts.first, meetCode(String(u)) != nil else { continue }
         out.append(LiveCall(url: String(u), title: parts.count > 1 ? String(parts[1]) : ""))
     }
     return out
+}
+
+// Reading Chrome's tabs over AppleScript takes seconds. Polled inline it stalls
+// the whole loop, which is how a short meeting got missed entirely: by the time
+// the state machine looked again, the call was over. Refresh it off to one side.
+final class TabCache: @unchecked Sendable {
+    private let lock = NSLock()
+    private var tabs: [LiveCall] = []
+    var current: [LiveCall] {
+        get { lock.lock(); defer { lock.unlock() }; return tabs }
+        set { lock.lock(); tabs = newValue; lock.unlock() }
+    }
+}
+let tabCache = TabCache()
+
+func startTabWatcher() {
+    Thread.detachNewThread {
+        while true {
+            tabCache.current = liveMeetTabs()
+            Thread.sleep(forTimeInterval: 2)
+        }
+    }
 }
 
 struct Resolved {
@@ -202,6 +235,10 @@ func hms(_ s: TimeInterval) -> String {
 setvbuf(stdout, nil, _IOLBF, 0)   // line-buffer so output survives being killed
 
 let args = CommandLine.arguments
+func argValue(_ k: String) -> String? {
+    guard let i = args.firstIndex(of: k), i + 1 < args.count else { return nil }
+    return args[i + 1]
+}
 let useCalendar = !args.contains("--no-calendar")
 let confirmAfter: TimeInterval = {
     if let i = args.firstIndex(of: "--confirm"), i + 1 < args.count,
@@ -214,6 +251,115 @@ if args.contains("--once") {
     print(h.isEmpty ? "no process is holding the mic"
                     : h.map { "\($0.bundle) (pid \($0.pid)) holds the mic" }.joined(separator: "\n"))
     exit(0)
+}
+
+// ───────────────────────── Capture handoff ─────────────────────────
+// Capture has to be launched through launchd, not spawned as a child: a child
+// inherits our responsible process and gets no TCC identity, so its process tap
+// would silently record zeros.
+
+let captureApp = argValue("--capture-app")
+    ?? URL(fileURLWithPath: CommandLine.arguments[0])
+        .deletingLastPathComponent().appendingPathComponent("Capture.app").path
+let captureMic = argValue("--mic")
+let recordingRoot = argValue("--recordings")
+    ?? FileManager.default.homeDirectoryForCurrentUser
+        .appendingPathComponent("Documents/Recordings/meetingd").path
+let captureEnabled = !args.contains("--no-capture")
+
+var sessionDir: URL?
+var captureGeneration = 0
+
+func slug(_ s: String) -> String {
+    let ok = s.unicodeScalars.map { CharacterSet.alphanumerics.contains($0) ? Character($0) : "-" }
+    return String(ok).replacingOccurrences(of: "-+", with: "-", options: .regularExpression)
+        .trimmingCharacters(in: CharacterSet(charactersIn: "-")).prefix(60).description
+}
+
+func launchCapture(dir: URL, appName: String) {
+    var a = ["-n", "-a", captureApp, "--args",
+             "--session", dir.path,
+             "--bundle", appName,
+             "--out", dir.appendingPathComponent("capture.log").path]
+    if let captureMic { a += ["--mic", captureMic] }
+    let p = Process()
+    p.executableURL = URL(fileURLWithPath: "/usr/bin/open")
+    p.arguments = a
+    do { try p.run() } catch { emit("CAPTURE", "failed to launch: \(error.localizedDescription)") }
+}
+
+/// Capture is headless, and macOS kills a background app the moment you grant it
+/// a permission. Without a check, that failure is completely invisible - so
+/// confirm it actually came up, and say so loudly if it did not.
+func confirmCaptureStarted(dir: URL, appName: String, attempt: Int = 1) {
+    let generation = captureGeneration
+    DispatchQueue.global().asyncAfter(deadline: .now() + 4) {
+        guard generation == captureGeneration else { return }   // meeting already ended
+        if FileManager.default.fileExists(atPath: dir.appendingPathComponent("capture.pid").path) {
+            if attempt > 1 { emit("CAPTURE", "recording after retry") }
+            return
+        }
+        if attempt == 1 {
+            emit("CAPTURE", "did not start — retrying (macOS kills the app when a permission is granted)")
+            launchCapture(dir: dir, appName: appName)
+            confirmCaptureStarted(dir: dir, appName: appName, attempt: 2)
+        } else {
+            emit("CAPTURE", "NOT RECORDING — check Privacy & Security > Microphone and Screen & System Audio Recording")
+        }
+    }
+}
+
+func startCapture(_ r: Resolved?, holder: String) {
+    guard captureEnabled else { return }
+    let f = DateFormatter(); f.dateFormat = "yyyy-MM-dd-HHmmss"
+    let name = f.string(from: Date()) + (r.map { "-" + slug($0.title) } ?? "")
+    let dir = URL(fileURLWithPath: recordingRoot).appendingPathComponent(name)
+    try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+    sessionDir = dir
+    captureGeneration += 1
+
+    if let r {
+        var meta: [String: Any] = ["title": r.title, "attendees": r.attendees,
+                                   "source": r.source, "confident": r.confident]
+        if let u = r.meetURL { meta["meet_url"] = u }
+        if let d = try? JSONSerialization.data(withJSONObject: meta, options: .prettyPrinted) {
+            try? d.write(to: dir.appendingPathComponent("meeting.json"))
+        }
+    }
+
+    // Tap whatever app took the mic, not a hardcoded browser.
+    let appName = holder.components(separatedBy: ".").dropLast().last ?? "Chrome"
+    launchCapture(dir: dir, appName: appName)
+    emit("CAPTURE", "recording to \(dir.lastPathComponent)", ["dir": dir.path])
+    confirmCaptureStarted(dir: dir, appName: appName)
+}
+
+func stopCapture() {
+    guard let dir = sessionDir else { return }
+    sessionDir = nil
+    captureGeneration += 1
+    let pidFile = dir.appendingPathComponent("capture.pid")
+    guard let text = try? String(contentsOf: pidFile, encoding: .utf8),
+          let pid = pid_t(text.trimmingCharacters(in: .whitespacesAndNewlines)) else {
+        emit("CAPTURE", "no pidfile — capture may still be running")
+        return
+    }
+    kill(pid, SIGTERM)
+    emit("CAPTURE", "stopped (pid \(pid))")
+}
+
+func addMark(_ kind: String, _ fields: [String: Any]) {
+    guard let dir = sessionDir else { return }
+    var row = fields
+    row["mark"] = kind
+    row["ts"] = ISO8601DateFormatter().string(from: Date())
+    guard let d = try? JSONSerialization.data(withJSONObject: row) else { return }
+    let url = dir.appendingPathComponent("marks.jsonl")
+    if let fh = try? FileHandle(forWritingTo: url) {
+        fh.seekToEndOfFile(); fh.write(d); fh.write("\n".data(using: .utf8)!); try? fh.close()
+    } else {
+        try? (String(data: d, encoding: .utf8)! + "\n").write(to: url, atomically: true, encoding: .utf8)
+    }
 }
 
 let cal = CalendarSource()
@@ -247,6 +393,8 @@ if args.contains("--match-now") {
 
 enum State { case idle, candidate(Date), meeting(Date) }
 var state: State = .idle
+var micMissingSince: Date?
+let endGrace: TimeInterval = Double(argValue("--end-grace") ?? "") ?? 6
 var currentKey: String?
 var segments = 0
 
@@ -261,7 +409,7 @@ func cleanTitle(_ t: String) -> String {
 
 /// Identity, best source first: the live Meet room beats anything the calendar guesses.
 func resolve(at now: Date) -> Resolved? {
-    let tabs = liveMeetTabs()
+    let tabs = tabCache.current
     let events = useCalendar ? cal.inProgress(at: now) : []
 
     for t in tabs {
@@ -296,11 +444,48 @@ func describe(_ r: Resolved) -> String {
     return r.title + u + (r.confident ? "" : "   [low confidence: \(r.source)]")
 }
 
+// A capture launched by a previous run survives our restart and keeps writing
+// to a folder nobody is managing. Reap them before starting.
+if captureEnabled, let dirs = try? FileManager.default.contentsOfDirectory(
+        at: URL(fileURLWithPath: recordingRoot), includingPropertiesForKeys: nil) {
+    var reaped = 0
+    for d in dirs {
+        let pf = d.appendingPathComponent("capture.pid")
+        guard let t = try? String(contentsOf: pf, encoding: .utf8),
+              let pid = pid_t(t.trimmingCharacters(in: .whitespacesAndNewlines)) else { continue }
+        if kill(pid, 0) == 0 { kill(pid, SIGTERM); reaped += 1 }
+        try? FileManager.default.removeItem(at: pf)
+    }
+    if reaped > 0 { print("stopped \(reaped) orphaned capture(s)") }
+}
+
+// Clear the TCC prompts now rather than in front of a real meeting.
+if captureEnabled && !args.contains("--no-warmup") {
+    let w = Process()
+    w.executableURL = URL(fileURLWithPath: "/usr/bin/open")
+    w.arguments = ["-n", "-a", captureApp, "--args", "--warmup",
+                   "--out", NSTemporaryDirectory() + "meetingd-warmup.log"]
+    try? w.run()
+    print("warming up capture permissions…")
+    DispatchQueue.global().asyncAfter(deadline: .now() + 6) {
+        let w2 = Process()
+        w2.executableURL = URL(fileURLWithPath: "/usr/bin/open")
+        w2.arguments = w.arguments
+        try? w2.run()
+    }
+}
+
+startTabWatcher()
+Thread.sleep(forTimeInterval: 0.5)   // let the first tab read land
 print("meetingd watching (confirm after \(Int(confirmAfter))s)…  log: \(logURL.path)")
 
 while true {
     let now = Date()
-    let live = micHolders().filter { $0.bundle != "unknown" }
+    let ignored = ["com.apple.Sound-Settings", "com.apple.systempreferences",
+                   "com.bgilpin.capture", "com.bgilpin.meetingd"]
+    let live = micHolders().filter { h in
+        h.bundle != "unknown" && !ignored.contains(where: { h.bundle.hasPrefix($0) })
+    }
 
     switch state {
     case .idle:
@@ -319,6 +504,7 @@ while true {
             if let r, r.confident {
                 state = .meeting(since); segments = 1; currentKey = r.key
                 emit("MEETING", describe(r), fields(r))
+                startCapture(r, holder: live.first?.bundle ?? "com.google.Chrome")
             } else if heldLongEnough {
                 state = .meeting(since); segments = 1
                 if let r {
@@ -329,6 +515,7 @@ while true {
                     emit("MEETING", "unidentified call (no Meet tab, no calendar match)",
                          ["source": "duration", "confident": false])
                 }
+                startCapture(r, holder: live.first?.bundle ?? "com.google.Chrome")
                 if tabReadFailed {
                     emit("NO TABS", "could not read Chrome tabs — grant Automation access for accurate naming")
                 }
@@ -337,14 +524,24 @@ while true {
 
     case .meeting(let since):
         if live.isEmpty {
+            // Chrome's audio processes churn mid-call. Ending on a single empty
+            // poll cut a meeting one second after it started.
+            if micMissingSince == nil { micMissingSince = now }
+            guard let gone = micMissingSince, now.timeIntervalSince(gone) >= endGrace else { break }
+            let ended = gone
             state = .idle
-            emit("END", "\(hms(now.timeIntervalSince(since)))  →  \(segments) segment(s)",
-                 ["duration_s": Int(now.timeIntervalSince(since)), "segments": segments])
-            currentKey = nil; segments = 0
-        } else if let r = resolve(at: now), r.confident, r.key != currentKey {
-            currentKey = r.key; segments += 1
-            var f = fields(r); f["segment"] = segments
-            emit("SPLIT HINT", "moved to: \(describe(r))", f)
+            emit("END", "\(hms(ended.timeIntervalSince(since)))  →  \(segments) segment(s)",
+                 ["duration_s": Int(ended.timeIntervalSince(since)), "segments": segments])
+            stopCapture()
+            currentKey = nil; segments = 0; micMissingSince = nil
+        } else {
+            micMissingSince = nil          // mic is back; it was only a blip
+            if let r = resolve(at: now), r.confident, r.key != currentKey {
+                currentKey = r.key; segments += 1
+                var f = fields(r); f["segment"] = segments
+                emit("SPLIT HINT", "moved to: \(describe(r))", f)
+                addMark("split", f)
+            }
         }
     }
 
