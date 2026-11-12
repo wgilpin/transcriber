@@ -28,3 +28,6 @@ uv.lock
 
 # detector build artifact
 detector/meetingd
+detector/capture
+detector/captureprobe
+detector/*.app

@@ -4,6 +4,10 @@
 <dict>
   <key>CFBundleIdentifier</key><string>com.bgilpin.meetingd</string>
   <key>CFBundleName</key><string>meetingd</string>
+  <key>NSMicrophoneUsageDescription</key>
+  <string>Records your side of the meeting.</string>
+  <key>NSAudioCaptureUsageDescription</key>
+  <string>Records the other participants' audio from the meeting app.</string>
   <key>NSAppleEventsUsageDescription</key>
   <string>Reads the Google Meet tab URL so calls are matched to the right meeting.</string>
   <key>NSCalendarsFullAccessUsageDescription</key>
