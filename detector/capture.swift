@@ -254,6 +254,11 @@ final class Counters: @unchecked Sendable {
 }
 let counters = Counters()
 
+/// Pausing writes silence rather than skipping buffers. The two tracks are
+/// aligned by position in the file, so dropping frames would slide everything
+/// after the pause earlier and put your words under someone else's name.
+nonisolated(unsafe) var micPaused: sig_atomic_t = 0
+
 var procID: AudioDeviceIOProcID?
 guard AudioDeviceCreateIOProcIDWithBlock(&procID, aggID, nil, { _, inData, _, _, _ in
     let abl = UnsafeMutableAudioBufferListPointer(UnsafeMutablePointer(mutating: inData))
@@ -339,10 +344,15 @@ func setUpMic() {
                 }
             }
             counters.lock.lock()
-            counters.micPeak = max(counters.micPeak, peak)
+            counters.micPeak = micPaused != 0 ? 0 : max(counters.micPeak, peak)
             if peak > 0 { counters.micEverNonZero = true }
             counters.micFrames += Int64(buf.frameLength)
             counters.lock.unlock()
+            if micPaused != 0, let ch = buf.floatChannelData {
+                for c in 0..<Int(buf.format.channelCount) {
+                    ch[c].update(repeating: 0, count: Int(buf.frameLength))
+                }
+            }
             writeQ.async { try? micFile?.write(from: buf) }
         }
         NotificationCenter.default.addObserver(
@@ -389,13 +399,31 @@ if warmup {
 nonisolated(unsafe) var stopFlag: sig_atomic_t = 0
 signal(SIGINT) { _ in stopFlag = 1 }
 signal(SIGTERM) { _ in stopFlag = 1 }
+// The UI toggles the mic without disturbing the call: the far end still hears
+// you, and only what lands in mic.wav changes.
+signal(SIGUSR1) { _ in micPaused = micPaused == 0 ? 1 : 0 }
 
 var micZeroWarned = false
+// Spans of the recording where the mic was muted, as offsets in seconds. The
+// transcript has a gap there and should be able to say why, rather than leave
+// it looking like you sat in silence.
+var mutes: [[Double]] = []
+var mutedSince: Double?
 let started = Date()
 print("recording… (ctrl-C to stop)\n")
 while stopFlag == 0 {
     if seconds > 0, Date().timeIntervalSince(started) >= seconds { break }
     Thread.sleep(forTimeInterval: 0.5)
+
+    let now = Date().timeIntervalSince(started)
+    if micPaused != 0, mutedSince == nil {
+        mutedSince = now
+        print("mic muted — still recording, the far end still hears you")
+    } else if micPaused == 0, let from = mutedSince {
+        mutes.append([from, now])
+        mutedSince = nil
+        print(String(format: "mic unmuted after %.0fs", now - from))
+    }
     counters.lock.lock()
     let fp = counters.farPeak; counters.farPeak = 0
     let mp = counters.micPeak; counters.micPeak = 0
@@ -445,6 +473,7 @@ var sidecar: [String: Any] = [
     "mic_track": micAllowed ? "mic.wav" : NSNull(),
     "tapped_bundle": wantBundle,
     "aec": useAEC,
+    "mic_muted": mutes + (mutedSince.map { [[$0, ended.timeIntervalSince(started)]] } ?? []),
     "mic_frames": counters.micFrames,
     "mic_started": micStarted.map { iso.string(from: $0) } ?? NSNull(),
     "far_started": farStarted.map { iso.string(from: $0) } ?? NSNull(),

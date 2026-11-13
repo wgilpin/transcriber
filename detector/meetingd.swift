@@ -210,6 +210,14 @@ let logURL: URL = {
 let clock: DateFormatter = { let f = DateFormatter(); f.dateFormat = "HH:mm:ss"; return f }()
 let iso = ISO8601DateFormatter()
 
+let emitJSON = CommandLine.arguments.contains("--json")
+
+// Launched by the menu bar app, we must not outlive it. The app can be killed
+// in ways that never run its termination handler, and an orphaned detector then
+// holds the lock against every app that starts afterwards.
+let exitWithParent = CommandLine.arguments.contains("--exit-with-parent")
+let launchedBy = getppid()
+
 func emit(_ kind: String, _ human: String, _ fields: [String: Any] = [:]) {
     print("[\(clock.string(from: Date()))] \(kind.padding(toLength: 11, withPad: " ", startingAt: 0))\(human)")
     fflush(stdout)
@@ -219,6 +227,9 @@ func emit(_ kind: String, _ human: String, _ fields: [String: Any] = [:]) {
     guard let data = try? JSONSerialization.data(withJSONObject: row),
           var line = String(data: data, encoding: .utf8) else { return }
     line += "\n"
+    // The menu bar app runs us as a child and reads this: structured events on
+    // stdout, interleaved with the human lines, which it ignores.
+    if emitJSON { FileHandle.standardOutput.write(line.data(using: .utf8)!) }
     if let fh = try? FileHandle(forWritingTo: logURL) {
         fh.seekToEndOfFile(); fh.write(line.data(using: .utf8)!); try? fh.close()
     } else {
@@ -531,6 +542,11 @@ Thread.sleep(forTimeInterval: 0.5)   // let the first tab read land
 print("meetingd watching (confirm after \(Int(confirmAfter))s)…  log: \(logURL.path)")
 
 while true {
+    if exitWithParent, getppid() != launchedBy {
+        emit("EXIT", "the app that launched us is gone")
+        stopCapture()
+        exit(0)
+    }
     let now = Date()
     let ignored = ["com.apple.Sound-Settings", "com.apple.systempreferences",
                    "com.bgilpin.capture", "com.bgilpin.meetingd"]
