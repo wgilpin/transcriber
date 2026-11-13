@@ -7,7 +7,7 @@ for t in meetingd captureprobe capture; do
   echo "built ./$t"
 done
 
-swiftc -O menubar.swift -o MeetingNotes
+swiftc -O main.swift notes.swift -o MeetingNotes
 echo "built ./MeetingNotes"
 
 # Capture needs a real bundle launched by launchd, or TCC will never prompt

@@ -69,6 +69,8 @@ let configURL = FileManager.default.homeDirectoryForCurrentUser
     .appendingPathComponent(".meetingd/config.json")
 let appLogURL = FileManager.default.homeDirectoryForCurrentUser
     .appendingPathComponent(".meetingd/app.log")
+let recordingsRoot = FileManager.default.homeDirectoryForCurrentUser
+    .appendingPathComponent("Documents/Recordings/meetingd")
 
 /// Everything the detector says, kept where it can be read later. A menu bar
 /// app has nowhere to print, so without this a line like "calendar DENIED"
@@ -125,6 +127,7 @@ final class Controller: NSObject, NSApplicationDelegate {
     var detectorNote: String?      // why the detector is not running, if it isn't
     var quitting = false
     var loggedSymbol = false
+    var notesWindow: NotesWindow?
     var restarts = 0
 
     // kill(1) and a crash both skip applicationWillTerminate, so catch the
@@ -410,6 +413,11 @@ final class Controller: NSObject, NSApplicationDelegate {
         }
 
         menu.addItem(.separator())
+        let meetings = NSMenuItem(title: "Meetings…", action: #selector(showNotes),
+                                  keyEquivalent: "m")
+        meetings.target = self
+        menu.addItem(meetings)
+
         let open = NSMenuItem(title: "Open recordings", action: #selector(openRecordings),
                               keyEquivalent: "")
         open.target = self
@@ -438,9 +446,16 @@ final class Controller: NSObject, NSApplicationDelegate {
     }
 
     @objc func openRecordings() {
-        let root = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent("Documents/Recordings/meetingd")
-        NSWorkspace.shared.open(sessionDir ?? root)
+        NSWorkspace.shared.open(sessionDir ?? recordingsRoot)
+    }
+
+    @objc func showNotes() {
+        if notesWindow == nil { notesWindow = NotesWindow(root: recordingsRoot) }
+        notesWindow?.reload()
+        // An accessory app has to ask for focus; without this the window opens
+        // behind whatever you were looking at.
+        NSApp.activate(ignoringOtherApps: true)
+        notesWindow?.window?.makeKeyAndOrderFront(nil)
     }
 
     @objc func openLog() { NSWorkspace.shared.open(appLogURL) }
@@ -450,6 +465,18 @@ final class Controller: NSObject, NSApplicationDelegate {
 
 extension Controller: NSMenuDelegate {
     func menuNeedsUpdate(_ menu: NSMenu) { buildMenu() }
+}
+
+// The list is hard to check by looking at it, so it can print itself.
+if CommandLine.arguments.contains("--dump-notes") {
+    for g in groupByDay(loadNotes(root: recordingsRoot)) {
+        print("\n\(g.label)")
+        for n in g.notes {
+            let part = n.part.map { " [\($0)/\(n.parts)]" } ?? ""
+            print("  \(n.time)  \(n.length.padding(toLength: 5, withPad: " ", startingAt: 0))\(part)  \(n.title)")
+        }
+    }
+    exit(0)
 }
 
 let app = NSApplication.shared
