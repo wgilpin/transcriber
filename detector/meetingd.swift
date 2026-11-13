@@ -444,17 +444,68 @@ func describe(_ r: Resolved) -> String {
     return r.title + u + (r.confident ? "" : "   [low confidence: \(r.source)]")
 }
 
-// A capture launched by a previous run survives our restart and keeps writing
-// to a folder nobody is managing. Reap them before starting.
+// One detector per machine. Two of them double every event, lose each other's
+// writes to the shared log - seekToEndOfFile is not atomic across processes -
+// and reap each other's captures. An instance left running overnight is easy to
+// forget, so refuse rather than quietly join in.
+let lockURL = logURL.deletingLastPathComponent().appendingPathComponent("meetingd.lock")
+let lockFD = open(lockURL.path, O_CREAT | O_RDWR, 0o644)
+if lockFD < 0 {
+    print("cannot lock \(lockURL.path) — continuing unlocked")
+} else if flock(lockFD, LOCK_EX | LOCK_NB) != 0 {
+    let other = ((try? String(contentsOf: lockURL, encoding: .utf8)) ?? "")
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+    print("meetingd is already running" + (other.isEmpty ? "" : " as pid \(other)") + " — exiting.")
+    print(other.isEmpty ? "Stop it first." : "Stop it first:  kill \(other)")
+    exit(1)
+} else {
+    ftruncate(lockFD, 0)
+    let mine = "\(getpid())\n"
+    _ = mine.withCString { write(lockFD, $0, strlen($0)) }
+}
+
+// A capture launched by a previous run survives our restart. If it is still
+// recording the meeting that is live right now, adopt it: killing it would
+// split one meeting across two folders and lose the audio in between. Anything
+// else - a finished call, a crash, a different room - is debris.
 if captureEnabled, let dirs = try? FileManager.default.contentsOfDirectory(
         at: URL(fileURLWithPath: recordingRoot), includingPropertiesForKeys: nil) {
-    var reaped = 0
+    let liveCodes = Set(liveMeetTabs().compactMap { meetCode($0.url) })
+    var running: [(dir: URL, pid: pid_t, code: String?, started: Date)] = []
+
     for d in dirs {
         let pf = d.appendingPathComponent("capture.pid")
         guard let t = try? String(contentsOf: pf, encoding: .utf8),
               let pid = pid_t(t.trimmingCharacters(in: .whitespacesAndNewlines)) else { continue }
-        if kill(pid, 0) == 0 { kill(pid, SIGTERM); reaped += 1 }
-        try? FileManager.default.removeItem(at: pf)
+        guard kill(pid, 0) == 0 else {            // pidfile left behind by a dead process
+            try? FileManager.default.removeItem(at: pf)
+            continue
+        }
+        var code: String?
+        if let md = try? Data(contentsOf: d.appendingPathComponent("meeting.json")),
+           let m = try? JSONSerialization.jsonObject(with: md) as? [String: Any],
+           let u = m["meet_url"] as? String { code = meetCode(u) }
+        let started = (try? pf.resourceValues(forKeys: [.creationDateKey]).creationDate) ?? Date()
+        running.append((d, pid, code, started))
+    }
+
+    if let keep = running.filter({ $0.code.map(liveCodes.contains) ?? false })
+                         .max(by: { $0.started < $1.started }) {
+        sessionDir = keep.dir
+        state = .meeting(keep.started)
+        currentKey = keep.code
+        let marks = (try? String(contentsOf: keep.dir.appendingPathComponent("marks.jsonl"),
+                                 encoding: .utf8)) ?? ""
+        segments = 1 + marks.split(separator: "\n").filter { !$0.isEmpty }.count
+        emit("ADOPTED", "\(keep.dir.lastPathComponent) is still recording this call (pid \(keep.pid))",
+             ["dir": keep.dir.path, "pid": Int(keep.pid), "segments": segments])
+    }
+
+    var reaped = 0
+    for r in running where r.dir != sessionDir {
+        kill(r.pid, SIGTERM)
+        try? FileManager.default.removeItem(at: r.dir.appendingPathComponent("capture.pid"))
+        reaped += 1
     }
     if reaped > 0 { print("stopped \(reaped) orphaned capture(s)") }
 }
