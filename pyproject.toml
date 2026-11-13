@@ -8,7 +8,9 @@ dependencies = [
     "colorama>=0.4.6",
     "dotenv>=0.9.9",
     "ollama>=0.5.1",
-    "torch>=2.7.1",
+    "parakeet-mlx>=0.7.0",
+    "pyannote-audio>=4.0.7",
+    "soundfile>=0.13.1",
+    "torch>=2.15.0",
     "transformers>=4.53.2",
-    "whisper>=1.1.10",
 ]

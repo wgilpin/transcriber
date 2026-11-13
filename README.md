@@ -6,7 +6,7 @@ It's designed for anyone who needs to process meeting audio efficiently, turning
 
 ## Features
 
-- **Accurate Transcription**: Utilizes OpenAI's **Whisper** model for high-quality, timestamped transcription.
+- **Accurate Transcription**: Uses NVIDIA's **Parakeet TDT** through **MLX**, which runs on the GPU and transcribes a half-hour meeting in under 20 seconds.
 - **Speaker Diarization**: Employs **`pyannote.audio`** to distinguish between different speakers in the recording and label their dialogue.
 - **LLM-Powered Insights**: Connects to a local **Ollama** instance to:
 
@@ -29,10 +29,10 @@ It's designed for anyone who needs to process meeting audio efficiently, turning
 
 - Python 3.8+
 - [Ollama](https://ollama.com/) installed and running locally.
-- An LLM pulled via Ollama (the script is configured for `gemma3:27b` but can be changed).
+- An LLM pulled via Ollama (the script is configured for `gemma4:26b` but can be changed).
 
   ```bash
-  ollama pull gemma3:27b
+  ollama pull gemma4:26b
   ```
 
 - [PyTorch](https://pytorch.org/get-started/locally/)
@@ -43,8 +43,8 @@ You can install the required packages using pip. It's recommended to do this in 
 
 ```bash
 uv pip install torch torchvision torchaudio
-uv pip install openai-whisper
-uv pip install pyannote.audio
+uv pip install parakeet-mlx
+uv pip install "pyannote.audio>=4.0"
 uv pip install ollama
 uv pip install python-dotenv
 ```
@@ -53,7 +53,7 @@ _Note: The `pyannote.audio` library may require you to accept user conditions on
 
 ### API Keys
 
-- **Hugging Face**: The `pyannote/speaker-diarization-3.1` model requires authentication. You will need a Hugging Face account and an API token with "read" access.
+- **Hugging Face**: The `pyannote/speaker-diarization-community-1` model is gated. You need a Hugging Face account, an API token with "read" access, and you must accept the model's terms at <https://huggingface.co/pyannote/speaker-diarization-community-1> with that same account. There is no older model to fall back to - `pyannote.audio` 4 resolves the former `speaker-diarization-3.1` name to community-1 as well.
 
 ## Setup
 
@@ -123,7 +123,7 @@ python transcribe.py meeting.wav --interactive
 
 ## How It Works: The Processing Pipeline
 
-1. **Transcription**: The audio is first transcribed by **Whisper** to generate text with word-level timestamps.
+1. **Transcription**: The audio is first transcribed by **Parakeet** to generate text with word-level timestamps.
 2. **Diarization**: **`pyannote.audio`** analyzes the audio to determine _who_ spoke and _when_, creating a timeline of speaker segments.
 3. **Combination & Cleanup**: The script merges the transcription with the diarization data, assigning a speaker label to each word. It then runs cleanup routines to fix short `UNKNOWN` segments that occur between two turns from the same speaker.
 4. **Formatting**: The raw data is formatted into a readable transcript, merging consecutive dialogue from the same speaker into a single block.
@@ -138,6 +138,6 @@ python transcribe.py meeting.wav --interactive
 
 The following models can be configured at the top of the `transcribe.py` script:
 
-- `WHISPER_MODEL`: The Whisper model size (e.g., `base.en`, `medium.en`).
+- `ASR_MODEL`: The speech recognition model (e.g., `mlx-community/parakeet-tdt-0.6b-v3`).
 - `DIARIZATION_MODEL`: The Pyannote diarization model from Hugging Face.
 - `OLLAMA_MODEL`: The model name to be used with your local Ollama instance.

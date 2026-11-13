@@ -8,7 +8,8 @@ from dotenv import load_dotenv
 
 import torch
 import ollama
-import whisper
+from huggingface_hub.errors import GatedRepoError
+from parakeet_mlx import from_pretrained as load_parakeet
 from pyannote.audio import Pipeline
 from pyannote.core import Annotation
 from pyannote.audio.core.io import Audio
@@ -16,9 +17,18 @@ from pyannote.audio.core.io import Audio
 from colorama import Fore, Back, Style
 
 # --- Configuration ---
-WHISPER_MODEL = "base.en"
-DIARIZATION_MODEL = "pyannote/speaker-diarization-3.1"
-OLLAMA_MODEL = "gemma3:27b"
+# Parakeet TDT runs on the GPU through MLX, so unlike openai-whisper it needs no
+# CPU fallback on this machine. Measured at ~105x realtime: a half-hour meeting
+# transcribes in about 15 seconds.
+ASR_MODEL = "mlx-community/parakeet-tdt-0.6b-v3"
+# A whole meeting at once would hold the full attention matrix in memory; these
+# chunks keep it flat, and the overlap is what stitches words across the seams.
+CHUNK_DURATION_S = 120.0
+CHUNK_OVERLAP_S = 15.0
+DIARIZATION_MODEL = "pyannote/speaker-diarization-community-1"
+# Gated on Hugging Face: accept the terms with the account behind HF_API_TOKEN.
+# pyannote.audio 4 resolves the old 3.1 name here too, so there is no way round it.
+OLLAMA_MODEL = "gemma4:26b"
 SUPPORTED_EXTENSIONS = [".mp3", ".wav", ".m4a", ".flac"]
 # Increased threshold for fixing UNKNOWN segments to handle longer pauses
 CLEANUP_TIME_THRESHOLD_S = 1.5
@@ -37,6 +47,77 @@ else:
     logging.warning(
         "Hugging Face API token not found. Diarization may fail if model needs auth."
     )
+
+
+# --- Speech recognition ---
+
+
+def load_asr():
+    """Loads the ASR model. MLX uses the GPU directly, so there is no device to pick."""
+    logging.info("Loading ASR model: %s", ASR_MODEL)
+    return load_parakeet(ASR_MODEL)
+
+
+def transcribe_words(asr_model, filepath):
+    """Transcribes audio into word chunks of {"text", "start", "end"}.
+
+    Parakeet emits sentencepiece subword tokens - " A", "w", "es", "ome", "." -
+    in which a leading space marks the start of a word. Regrouping them on that
+    boundary reproduces Whisper's word list exactly, leading space and trailing
+    punctuation included, so everything downstream of here is unchanged.
+    """
+    result = asr_model.transcribe(
+        str(filepath), chunk_duration=CHUNK_DURATION_S, overlap_duration=CHUNK_OVERLAP_S
+    )
+    words = []
+    for sentence in result.sentences:
+        for token in sentence.tokens:
+            if words and not token.text.startswith(" "):
+                words[-1]["text"] += token.text
+                words[-1]["end"] = token.end
+            else:
+                words.append(
+                    {"text": token.text, "start": token.start, "end": token.end}
+                )
+    return words
+
+
+def load_diarizer(device):
+    """Loads the diarization pipeline.
+
+    There is no older model to fall back to: pyannote.audio 4 resolves the 3.1
+    name to community-1 as well, so a gated repo fails either way. Say so
+    plainly rather than burying a 403 traceback.
+    """
+    try:
+        pipeline = Pipeline.from_pretrained(DIARIZATION_MODEL, token=hf_api_key)
+    except GatedRepoError:
+        raise SystemExit(
+            f"\n{DIARIZATION_MODEL} is gated on Hugging Face.\n"
+            f"Accept the terms at https://huggingface.co/{DIARIZATION_MODEL}\n"
+            "with the account that owns HF_API_TOKEN, then run this again.\n"
+        )
+    pipeline.to(device)
+    return pipeline
+
+
+def diarize(pipeline, filepath):
+    """Runs diarization and returns a plain Annotation.
+
+    pyannote.audio 4 wraps the result in a DiarizeOutput holding two versions:
+    speaker_diarization, where overlapping speech belongs to everyone talking,
+    and exclusive_speaker_diarization, where each instant has one speaker. We
+    label individual words, which can only have one speaker, so we take the
+    exclusive one - otherwise a word in an overlap is assigned to whichever
+    track happens to come first.
+    """
+    try:
+        waveform, sample_rate = Audio(sample_rate=16000, mono="downmix")(str(filepath))
+        result = pipeline({"waveform": waveform, "sample_rate": sample_rate})
+    except Exception as e:
+        logging.error("Diarization failed for %s: %s", filepath, e, exc_info=True)
+        return Annotation()
+    return getattr(result, "exclusive_speaker_diarization", result)
 
 # --- Helper Functions ---
 
@@ -454,7 +535,7 @@ def generate_highlights_section(combined_transcript: list, audio_filepath: str) 
 
 
 def process_audio_file(
-    filepath, whisper_model, diarization_pipeline, interactive_mode=False
+    filepath, asr_model, diarization_pipeline, interactive_mode=False
 ):
     """
     Processes an audio file to generate a transcript markdown file.
@@ -467,29 +548,11 @@ def process_audio_file(
 
     # 1. Transcription
     logging.info("Step 1: Transcribing audio...")
-    transcription_result = whisper_model.transcribe(
-        filepath, word_timestamps=True, fp16=False
-    )
-    transcription_chunks = []
-    for segment in transcription_result["segments"]:
-        for word in segment["words"]:
-            transcription_chunks.append(
-                {"text": word["word"], "start": word["start"], "end": word["end"]}
-            )
+    transcription_chunks = transcribe_words(asr_model, filepath)
 
     # 2. Diarization
     logging.info("Step 2: Performing speaker diarization...")
-    try:
-        audio_loader = Audio(sample_rate=16000, mono=True)
-        waveform, sample_rate = audio_loader(filepath)
-        diarization_result = diarization_pipeline(
-            {"waveform": waveform, "sample_rate": sample_rate}
-        )
-    except Exception as e:
-        logging.error(f"Error during diarization: {e}", exc_info=True)
-        diarization_result = Annotation()
-
-    diarization_fixed = apply_collar_fix(diarization_result)
+    diarization_fixed = apply_collar_fix(diarize(diarization_pipeline, filepath))
 
     # 3. Combine and Clean
     logging.info("Step 3: Combining transcription and diarization...")
@@ -856,29 +919,16 @@ def main():
     logging.info("Loading AI models...")
     if torch.cuda.is_available():
         pyannote_device = torch.device("cuda")
-        whisper_device = "cuda"
     elif torch.backends.mps.is_available():
         pyannote_device = torch.device("mps")
-        # Forcing Whisper to CPU to avoid MPS backend error
-        whisper_device = "cpu"
     else:
         pyannote_device = torch.device("cpu")
-        whisper_device = "cpu"
 
     logging.info(f"Pyannote will run on: {pyannote_device}")
-    logging.info(f"Whisper will run on: {whisper_device}")
 
     try:
-        whisper_model = whisper.load_model(WHISPER_MODEL, device=whisper_device)
-        hyperparameters = {"min_duration_on": 0.1, "onset": 0.7}
-        diarization_pipeline = Pipeline.from_pretrained(
-            DIARIZATION_MODEL, use_auth_token=hf_api_key
-        )
-        if hasattr(diarization_pipeline, "segmentation") and hasattr(
-            diarization_pipeline.segmentation, "hyperparameters"
-        ):
-            diarization_pipeline.segmentation.hyperparameters = hyperparameters
-        diarization_pipeline.to(pyannote_device)
+        asr_model = load_asr()
+        diarization_pipeline = load_diarizer(pyannote_device)
     except Exception as e:
         logging.error(f"Failed to load models: {e}", exc_info=True)
         sys.exit(1)
@@ -932,7 +982,7 @@ def main():
             else:
                 output_md_path_from_process = process_audio_file(
                     file_path,
-                    whisper_model,
+                    asr_model,
                     diarization_pipeline,
                     interactive_mode=args.interactive,
                 )

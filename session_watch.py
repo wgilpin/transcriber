@@ -18,9 +18,6 @@ from pathlib import Path
 import numpy as np
 import soundfile as sf
 import torch
-import whisper
-from pyannote.audio import Audio, Pipeline
-from pyannote.core import Annotation
 
 import transcribe as T
 
@@ -40,41 +37,25 @@ FAR_ALIVE_MIN = 0.10     # below this the far track never worked, so nothing can
 
 
 # --- models -----------------------------------------------------------------
-# Mirrors the loading in transcribe.main(). Duplicated deliberately: that file
-# has uncommitted work in it and is not mine to refactor.
+# Thin wrappers over transcribe.py, so both entry points load the same models.
 def load_models():
     if torch.cuda.is_available():
-        pyannote_device, whisper_device = torch.device("cuda"), "cuda"
+        pyannote_device = torch.device("cuda")
     elif torch.backends.mps.is_available():
-        pyannote_device, whisper_device = torch.device("mps"), "cpu"
+        pyannote_device = torch.device("mps")
     else:
-        pyannote_device, whisper_device = torch.device("cpu"), "cpu"
+        pyannote_device = torch.device("cpu")
 
-    logging.info("whisper on %s, pyannote on %s", whisper_device, pyannote_device)
-    model = whisper.load_model(T.WHISPER_MODEL, device=whisper_device)
-    pipeline = Pipeline.from_pretrained(T.DIARIZATION_MODEL, use_auth_token=T.hf_api_key)
-    if hasattr(pipeline, "segmentation") and hasattr(pipeline.segmentation, "hyperparameters"):
-        pipeline.segmentation.hyperparameters = {"min_duration_on": 0.1, "onset": 0.7}
-    pipeline.to(pyannote_device)
-    return model, pipeline
+    logging.info("pyannote on %s, ASR on MLX", pyannote_device)
+    return T.load_asr(), T.load_diarizer(pyannote_device)
 
 
 def transcribe_words(model, path):
-    result = model.transcribe(str(path), word_timestamps=True, fp16=False)
-    return [
-        {"text": w["word"], "start": w["start"], "end": w["end"]}
-        for seg in result["segments"]
-        for w in seg.get("words", [])
-    ]
+    return T.transcribe_words(model, path)
 
 
 def diarize(pipeline, path):
-    try:
-        waveform, sr = Audio(sample_rate=16000, mono=True)(str(path))
-        return pipeline({"waveform": waveform, "sample_rate": sr})
-    except Exception as e:
-        logging.error("diarization failed for %s: %s", path.name, e)
-        return Annotation()
+    return T.diarize(pipeline, path)
 
 
 # --- echo bleed -------------------------------------------------------------
@@ -179,7 +160,7 @@ def drop_bleed(mic_utts, far_utts, mic_env, far_env, hop, ratio_threshold):
         far_level = level(far_env, hop, u["start"], u["end"], FAR_PCT)
         ratio = mic_level / far_level if far_level > 1e-6 else float("inf")
 
-        # Whisper rarely transcribes the two copies of a sentence identically,
+        # The recognizer rarely transcribes the two copies of a sentence identically,
         # so strong level evidence is allowed to convict on a weaker text match.
         decisive = ratio < DECISIVE_RATIO and overlap >= DECISIVE_OVERLAP
         if decisive or (overlap >= BLEED_OVERLAP and ratio < ratio_threshold):
