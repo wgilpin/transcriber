@@ -547,13 +547,19 @@ def process_audio_file(
 
 def parse_md_transcript(content):
     """Parses the markdown transcript to extract speaker turns."""
-    turn_pattern = re.compile(r"\[.*?\] \*\*(SPEAKER_\d+|UNKNOWN)\*\*:(.*)")
+    turn_pattern = re.compile(r"\[(.*?)\] \*\*(SPEAKER_\d+|UNKNOWN)\*\*:(.*)")
     lines = content.split("\n")
     turns = []
     for line in lines:
         match = turn_pattern.match(line)
         if match:
-            turns.append({"speaker": match.group(1), "text": match.group(2).strip()})
+            turns.append(
+                {
+                    "timestamp": match.group(1).split(".")[0],
+                    "speaker": match.group(2),
+                    "text": match.group(3).strip(),
+                }
+            )
     return turns
 
 
@@ -583,7 +589,8 @@ def generate_speaker_hint_from_turns(
             if speaker == speaker_label
             else (Fore.WHITE + speaker)
         )
-        hint_lines.append(f"    {display_speaker}: {text}")
+        timestamp = Style.DIM + f"[{turn.get('timestamp', '?')}]" + Style.NORMAL
+        hint_lines.append(f"    {timestamp} {display_speaker}: {text}")
 
     return "\n".join(hint_lines), occurrence_index
 
@@ -608,8 +615,9 @@ def _get_speaker_name(label: str, turns: list, assigned_names: set) -> str | Non
             continue
 
         # --- Display context and prompt ---
+        snippet_time = turns[found_at].get("timestamp", "?")
         print(f"\n--- Who is {label}? (Press Enter for next hint) ---")
-        print("  Context:")
+        print(f"  Context (at {Fore.YELLOW + snippet_time + Fore.WHITE}):")
         print(hint)
 
         # Build a clear prompt for the user
