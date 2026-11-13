@@ -38,15 +38,15 @@ func u32Prop(_ o: AudioObjectID, _ sel: AudioObjectPropertySelector) -> UInt32? 
     return v
 }
 
-/// Devices that actually have input channels, with their names.
-func inputDevices() -> [(id: AudioObjectID, name: String)] {
+/// Devices that actually have input channels, with their names and transport.
+func inputDevices() -> [(id: AudioObjectID, name: String, transport: UInt32)] {
     var a = paddr(kAudioHardwarePropertyDevices)
     var size: UInt32 = 0
     guard AudioObjectGetPropertyDataSize(sysObj, &a, 0, nil, &size) == noErr, size > 0 else { return [] }
     var ids = [AudioObjectID](repeating: 0, count: Int(size) / MemoryLayout<AudioObjectID>.size)
     guard AudioObjectGetPropertyData(sysObj, &a, 0, nil, &size, &ids) == noErr else { return [] }
 
-    var out: [(AudioObjectID, String)] = []
+    var out: [(AudioObjectID, String, UInt32)] = []
     for d in ids {
         var ca = paddr(kAudioDevicePropertyStreamConfiguration, kAudioObjectPropertyScopeInput)
         var csz: UInt32 = 0
@@ -58,7 +58,8 @@ func inputDevices() -> [(id: AudioObjectID, name: String)] {
         let channels = abl.reduce(0) { $0 + Int($1.mNumberChannels) }
         guard channels > 0 else { continue }
         let name = stringProp(d, kAudioObjectPropertyName) ?? "device \(d)"
-        out.append((d, name))
+        let transport = u32Prop(d, kAudioDevicePropertyTransportType) ?? kAudioDeviceTransportTypeUnknown
+        out.append((d, name, transport))
     }
     return out
 }
@@ -89,8 +90,36 @@ if let path = argValue("--out") {
 }
 setvbuf(stdout, nil, _IOLBF, 0)
 
+/// Built-in, or a virtual device something else installed - neither is a mic
+/// you chose to speak into, and the built-in one is silent with the lid shut.
+func isExternal(_ transport: UInt32) -> Bool {
+    ![kAudioDeviceTransportTypeBuiltIn,
+      kAudioDeviceTransportTypeVirtual,
+      kAudioDeviceTransportTypeAggregate,
+      kAudioDeviceTransportTypeUnknown].contains(transport)
+}
+
+/// Which microphone to record, and why - the reason is worth printing, because
+/// picking one by hand means knowing which room you are in, and the answer
+/// changes when you plug something in or walk away from the desk.
+func chooseMic(_ want: String?) -> (id: AudioObjectID, name: String, why: String)? {
+    let devices = inputDevices()
+    if let want {
+        if let m = devices.first(where: { $0.name.localizedCaseInsensitiveContains(want) }) {
+            return (m.id, m.name, "asked for")
+        }
+        print("no input device matching '\(want)' — falling back")
+    }
+    if let m = devices.first(where: { isExternal($0.transport) }) {
+        return (m.id, m.name, "external")
+    }
+    return nil       // nothing plugged in: the system default is as good as it gets
+}
+
 if args.contains("--list-mics") {
-    for d in inputDevices() { print("\(d.name)") }
+    for d in inputDevices() {
+        print("\(d.name)\(isExternal(d.transport) ? "   [external]" : "")")
+    }
     exit(0)
 }
 
@@ -143,20 +172,29 @@ for o in processObjects() {
 let playing = matches.filter { $0.output }
 let chosen = playing.isEmpty ? matches : playing
 let warmup = args.contains("--warmup")
-if chosen.isEmpty && !warmup {
+if chosen.isEmpty && !warmup && args.contains("--tap-app") {
     print("no audio process matching '\(wantBundle)' — nothing to tap")
     exit(1)
 }
 
-// A global tap still triggers the audio-capture prompt when nothing happens to
-// be playing, which is what warm-up needs.
+// Tap everything but ourselves, rather than naming the meeting app's processes.
+// A per-process tap is bound to the process objects that existed when it was
+// made, so when Chrome moves its audio to a helper the tap never knew about,
+// the tap keeps running and writes digital silence - no error, no callback, an
+// eleven-minute hole in the middle of a recording. A global tap cannot be
+// outrun that way. The cost is that a notification chime lands on the far
+// track too, which is a far better failure than losing a quarter of the call.
+let selfPID = UInt32(getpid())
+let ownProcesses = processObjects().filter { u32Prop($0, kAudioProcessPropertyPID) == selfPID }
+
 let tapDesc: CATapDescription
-if chosen.isEmpty {
-    print("far track: nothing playing — global tap for warm-up only")
-    tapDesc = CATapDescription(stereoGlobalTapButExcludeProcesses: [])
-} else {
-    print("far track: tapping \(chosen.count) \(wantBundle) process(es)")
+if args.contains("--tap-app") {
+    print("far track: tapping \(chosen.count) \(wantBundle) process(es) only")
     tapDesc = CATapDescription(stereoMixdownOfProcesses: chosen.map { $0.obj })
+} else {
+    let playing = chosen.map { $0.bundle }.first ?? "nothing yet"
+    print("far track: global tap (\(wantBundle) is \(chosen.isEmpty ? "not playing" : "playing as \(playing)"))")
+    tapDesc = CATapDescription(stereoGlobalTapButExcludeProcesses: ownProcesses)
 }
 tapDesc.name = "meetingd-farend"
 tapDesc.isPrivate = true
@@ -253,19 +291,14 @@ func setUpMic() {
     let input = engine.inputNode
     // The system default input is often the built-in mic, which returns digital
     // silence when the lid is shut. Pick the device explicitly.
-    if let want = wantMic {
-        if let match = inputDevices().first(where: { $0.name.localizedCaseInsensitiveContains(want) }) {
-            var devID = match.id
-            if let unit = input.audioUnit {
-                let st = AudioUnitSetProperty(unit, kAudioOutputUnitProperty_CurrentDevice,
-                                              kAudioUnitScope_Global, 0, &devID,
-                                              UInt32(MemoryLayout<AudioDeviceID>.size))
-                print(st == noErr ? "mic device: \(match.name)"
-                                  : "could not select '\(match.name)': OSStatus \(st)")
-            }
-        } else {
-            print("no input device matching '\(want)'. Try --list-mics")
-        }
+    let picked = chooseMic(wantMic)
+    if let picked, let unit = input.audioUnit {
+        var devID = picked.id
+        let st = AudioUnitSetProperty(unit, kAudioOutputUnitProperty_CurrentDevice,
+                                      kAudioUnitScope_Global, 0, &devID,
+                                      UInt32(MemoryLayout<AudioDeviceID>.size))
+        print(st == noErr ? "mic device: \(picked.name) (\(picked.why))"
+                          : "could not select '\(picked.name)': OSStatus \(st)")
     }
     // Speakers mean the far end bleeds into the mic. macOS's own voice
     // processing cancels it, using system output as the reference signal.
@@ -289,8 +322,9 @@ func setUpMic() {
     if micFormat.sampleRate == 0 || micFormat.channelCount == 0 {
         micFormat = input.outputFormat(forBus: 0)
     }
-    if wantMic == nil {
-        print("mic device: \(AVCaptureDevice.default(for: .audio)?.localizedName ?? "unknown") (system default)")
+    if picked == nil {
+        let name = AVCaptureDevice.default(for: .audio)?.localizedName ?? "unknown"
+        print("mic device: \(name) (system default — nothing external plugged in)")
     }
     do {
         micFile = try AVAudioFile(forWriting: micURL,
