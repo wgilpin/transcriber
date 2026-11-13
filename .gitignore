@@ -31,3 +31,6 @@ detector/meetingd
 detector/capture
 detector/captureprobe
 detector/*.app
+
+detector/MeetingNotes
+detector/menubar

@@ -7,8 +7,13 @@ for t in meetingd captureprobe capture; do
   echo "built ./$t"
 done
 
+swiftc -O menubar.swift -o MeetingNotes
+echo "built ./MeetingNotes"
+
 # Capture needs a real bundle launched by launchd, or TCC will never prompt
-# and the process tap silently returns zeros.
+# and the process tap silently returns zeros. The menu bar app needs one too:
+# it is the responsible process for meetingd, so the calendar and Apple Events
+# prompts are attributed to it.
 bundle() {
   local app=$1 exe=$2 ident=$3
   rm -rf $app
@@ -20,3 +25,4 @@ bundle() {
 }
 bundle Capture.app capture com.bgilpin.capture
 bundle CaptureProbe.app captureprobe com.bgilpin.captureprobe
+bundle MeetingNotes.app MeetingNotes com.bgilpin.meetingnotes
