@@ -33,6 +33,10 @@ DECISIVE_OVERLAP = 0.3   # ...and needs only a partial text match to convict
 MIC_PCT = 50             # the mic is continuous: its median is representative
 FAR_PCT = 90             # the tap is gappy: only an upper percentile shows speech
 DEAD_RUN = 5.0           # exact silence this long on the far track means the tap died
+FAR_ALIVE_MIN = 0.10     # below this the far track never worked, so nothing can be dead
+# Measured: a real call with people talking runs ~72% active, because Chrome
+# streams continuously once you are in a room. A solo call is ~1.7% - stray
+# join and leave sounds. 10% sits in open space between the two.
 
 
 # --- models -----------------------------------------------------------------
@@ -331,7 +335,15 @@ def process_session(d: Path, model, pipeline, me: str, ratio_threshold: float):
         # Where the far track died, mic speech has no counterpart to test it
         # against. Most of it is bleed, some of it is you, and nothing here can
         # tell them apart - so say so rather than put your name to all of it.
-        dead = dead_spans(far_env, hop)
+        # A far track that was never alive is not a failed tap - it is a call
+        # with nobody else talking. Nothing bled through speakers that played
+        # nothing, so the mic is unambiguously you and relabelling it UNKNOWN
+        # would be worse than saying nothing.
+        far_alive = float((far_env >= 1e-5).mean())
+        dead = dead_spans(far_env, hop) if far_alive > FAR_ALIVE_MIN else []
+        if far_alive <= FAR_ALIVE_MIN:
+            logging.info("far track silent throughout (%.1f%% active) - treating as "
+                         "a call with no one else speaking", far_alive * 100)
         if dead:
             total = sum(b - a for a, b in dead)
             orphaned = 0
@@ -372,6 +384,53 @@ def write_notes(d: Path, session: dict, meeting: dict, merged: list, dropped: li
     return notes
 
 
+OLLAMA = "http://127.0.0.1:11434/api/tags"
+
+
+def ensure_ollama(wait=40):
+    """Start Ollama if it is not up, and wait for it to answer.
+
+    The app runs this unattended, so a quit menu bar app should not be the
+    difference between a note with a summary and a note with an error in place
+    of one. Starting the server is cheap; the model load is what takes time,
+    and that happens on the first query either way.
+    """
+    import subprocess
+    import urllib.error
+    import urllib.request
+
+    def up():
+        try:
+            urllib.request.urlopen(OLLAMA, timeout=2)
+            return True
+        except (urllib.error.URLError, OSError):
+            return False
+
+    if up():
+        return True
+    logging.info("ollama is not running - starting it")
+    # Launched from the app, PATH is launchd's minimal one and will not have
+    # /usr/local/bin in it, so look for the binary rather than trusting PATH.
+    import shutil
+    exe = shutil.which("ollama") or next(
+        (c for c in ("/usr/local/bin/ollama", "/opt/homebrew/bin/ollama") if Path(c).exists()),
+        None)
+    if exe:
+        subprocess.Popen([exe, "serve"],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         start_new_session=True)
+    else:
+        subprocess.run(["open", "-a", "Ollama"], capture_output=True)
+
+    for _ in range(wait):
+        if up():
+            logging.info("ollama is up")
+            return True
+        time.sleep(1)
+    logging.warning("ollama did not come up - notes will have no summary")
+    return False
+
+
 def pending(root: Path):
     for d in sorted(p for p in root.iterdir() if p.is_dir()):
         if not (d / "session.json").exists():
@@ -398,6 +457,7 @@ def main():
     if args.session:
         logging.info("loading models...")
         model, pipeline = load_models()
+        ensure_ollama()
         process_session(args.session, model, pipeline, args.me, args.bleed_ratio)
         return
 
@@ -409,6 +469,7 @@ def main():
 
     logging.info("loading models...")
     model, pipeline = load_models()
+    ensure_ollama()
 
     while True:
         for d in pending(args.root):
