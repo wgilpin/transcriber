@@ -473,7 +473,12 @@ if CommandLine.arguments.contains("--dump-notes") {
         print("\n\(g.label)")
         for n in g.notes {
             let part = n.part.map { " [\($0)/\(n.parts)]" } ?? ""
-            print("  \(n.time)  \(n.length.padding(toLength: 5, withPad: " ", startingAt: 0))\(part)  \(n.title)")
+            let meta = "\(n.time)  \(n.length)\(part) "
+            let pad = max(meta.count, 22)
+            print("  \(meta.padding(toLength: pad, withPad: " ", startingAt: 0))\(n.invite ?? "")")
+            if let sub = n.subtitle {
+                print("  \(String(repeating: " ", count: pad))\(sub)")
+            }
         }
     }
     exit(0)

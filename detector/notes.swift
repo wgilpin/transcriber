@@ -13,6 +13,7 @@ struct Note {
     let start: Date           // when the meeting began, not when the file was written
     let duration: TimeInterval
     let meetURL: String?
+    let invite: String?       // what the calendar called it, e.g. "Bill / Manuela"
     let part: Int?            // "1 - x.md" is part one of a split recording
     let parts: Int
 
@@ -21,10 +22,22 @@ struct Note {
         return f.string(from: start)
     }
 
+    /// The generated title, unless it only repeats what the invite already says -
+    /// an unrecorded call is named after its meet code at both ends, and showing
+    /// that twice tells you nothing.
+    var subtitle: String? {
+        title.caseInsensitiveCompare(invite ?? "") == .orderedSame ? nil : title
+    }
+
     var length: String {
         let m = Int(duration) / 60
-        return m >= 60 ? "\(m / 60)h \(m % 60)m" : "\(m)m"
+        if m >= 60 { return "\(m / 60)h \(m % 60)m" }
+        return m == 1 ? "1 min" : "\(m) mins"
     }
+}
+
+private extension String {
+    var nilIfEmpty: String? { isEmpty ? nil : self }
 }
 
 /// Parsed from the folder name when there is no session.json to say better.
@@ -59,6 +72,11 @@ func loadNotes(root: URL) -> [Note] {
             ?? (try? d.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate
             ?? Date.distantPast
         let duration = (session?["duration_s"] as? Double) ?? 0
+        // Calendar titles arrive padded - " Benchmarking and Evals Squad" - and
+        // an ad-hoc call has none at all.
+        let invite = (meeting?["title"] as? String)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .nilIfEmpty
 
         // A split recording writes "1 - title.md", "2 - title.md". Those are
         // separate meetings and belong in the list separately, in order.
@@ -84,6 +102,7 @@ func loadNotes(root: URL) -> [Note] {
                                 start: start.addingTimeInterval(from),
                                 duration: max(to - from, 0),
                                 meetURL: meeting?["meet_url"] as? String,
+                                invite: invite,
                                 part: n, parts: numbered.count))
             }
         } else if let url = mds.first {
@@ -91,6 +110,7 @@ func loadNotes(root: URL) -> [Note] {
                             title: url.deletingPathExtension().lastPathComponent,
                             start: start, duration: duration,
                             meetURL: meeting?["meet_url"] as? String,
+                            invite: invite,
                             part: nil, parts: 1))
         }
     }
@@ -344,33 +364,47 @@ final class NotesWindow: NSWindowController, NSOutlineViewDataSource, NSOutlineV
         }
         guard let note = item as? Note else { return nil }
 
+        // When and how long come first, then what the invite called it: that
+        // line is how you recognise a meeting. The generated title sits under
+        // it, because it describes what was said rather than which meeting.
         let time = NSTextField(labelWithString: note.time)
         time.font = .monospacedDigitSystemFont(ofSize: 11, weight: .regular)
         time.textColor = .secondaryLabelColor
 
-        var name = note.title
-        if let p = note.part { name = "\(p)/\(note.parts)  " + name }
-        let title = NSTextField(labelWithString: name)
+        let length = NSTextField(labelWithString: note.length)
+        length.font = .systemFont(ofSize: 11)
+        length.textColor = .tertiaryLabelColor
+
+        var called = note.invite ?? ""
+        if let p = note.part { called = "\(p)/\(note.parts)  " + called }
+        let invite = NSTextField(labelWithString: called)
+        invite.font = .systemFont(ofSize: 11, weight: .medium)
+        invite.textColor = .secondaryLabelColor
+        invite.lineBreakMode = .byTruncatingTail
+
+        let title = NSTextField(labelWithString: note.subtitle ?? "")
         title.font = .systemFont(ofSize: 13)
         title.lineBreakMode = .byTruncatingTail
 
-        let length = NSTextField(labelWithString: note.length)
-        length.font = .systemFont(ofSize: 10)
-        length.textColor = .tertiaryLabelColor
-
         let cell = NSTableCellView()
-        for sub in [title, time, length] {
+        for sub in [time, length, invite, title] {
             cell.addSubview(sub)
             sub.translatesAutoresizingMaskIntoConstraints = false
         }
+        // The invite name is the only part that may be long, so it is the only
+        // part allowed to shrink and truncate.
+        invite.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         NSLayoutConstraint.activate([
-            title.leadingAnchor.constraint(equalTo: cell.leadingAnchor, constant: 10),
+            time.leadingAnchor.constraint(equalTo: cell.leadingAnchor, constant: 10),
+            time.topAnchor.constraint(equalTo: cell.topAnchor, constant: 5),
+            length.leadingAnchor.constraint(equalTo: time.trailingAnchor, constant: 6),
+            length.firstBaselineAnchor.constraint(equalTo: time.firstBaselineAnchor),
+            invite.leadingAnchor.constraint(equalTo: length.trailingAnchor, constant: 8),
+            invite.trailingAnchor.constraint(lessThanOrEqualTo: cell.trailingAnchor, constant: -8),
+            invite.firstBaselineAnchor.constraint(equalTo: time.firstBaselineAnchor),
+            title.leadingAnchor.constraint(equalTo: time.leadingAnchor),
             title.trailingAnchor.constraint(lessThanOrEqualTo: cell.trailingAnchor, constant: -8),
-            title.topAnchor.constraint(equalTo: cell.topAnchor, constant: 5),
-            time.leadingAnchor.constraint(equalTo: title.leadingAnchor),
-            time.topAnchor.constraint(equalTo: title.bottomAnchor, constant: 2),
-            length.leadingAnchor.constraint(equalTo: time.trailingAnchor, constant: 8),
-            length.centerYAnchor.constraint(equalTo: time.centerYAnchor),
+            title.topAnchor.constraint(equalTo: time.bottomAnchor, constant: 2),
         ])
         return cell
     }
